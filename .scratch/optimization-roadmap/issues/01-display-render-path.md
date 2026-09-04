@@ -13,6 +13,11 @@ premises that a survey of the panel drivers has now falsified:
 2. *"Everything outside BUSY is single-digit milliseconds."* True of Fast
    only. FastClean carries **230 ms** of software overhead, 200 ms of it a
    timer with nothing behind it, on every view change and every wake. See A13.
+   **Resolved by #89, 2026-09-04, and the premise was right.** The 200 ms was
+   the timer: FastClean's software tail measured 226 ms before and 26 ms
+   after, which is Fast's own tail to the millisecond. Neither mode now
+   carries a mode-dependent overhead outside BUSY, so premise 2 is true of
+   both rather than of Fast alone.
 
 It also missed a category rather than a number: **WS-A only ever asked how
 fast a refresh is, never whether it should happen.** Nothing in the tree
@@ -53,6 +58,14 @@ FastClean (HALF) 25, Full 62.**
 Three modes, two parameters, sub-1 ms residuals. Full's `min=379` is its
 second pass reloading the Fast bank, which the model also predicts.
 
+**Re-confirmed independently 2026-09-04**, on a different card and book and a
+different capture, while measuring #89. Fast 379 (n=9 and n=7, min equal to
+max), FastClean 456 (n=26 and n=50, min equal to max), Full 930 max with a
+379 min on the same plan. The model was fitted on one log in July and
+predicts a fresh one to the millisecond, so **A12's 136 ms fixed term is a
+property of the controller rather than of that capture.** That strengthens
+A12: the term it proposes to attack is real and stable.
+
 **Two corrections fall straight out of this table.** The often-quoted
 **421 ms Fast BUSY** is a June 10 2026 capture (`docs/IMPLEMENTATION_PLAN.md`,
 board unnamed) and is superseded by 379 ms. The **"~3.5 s Full refresh"** that
@@ -61,9 +74,10 @@ Full BUSY on the X3 is 928 ms. Anything ranked against 3.5 s needs re-sizing.
 
 ## Open, if the render path is ever revisited
 
-Order: A14 (largest, and it subsumes several tracked items) → A13 (safest
-large win) → A12 (test first — one byte) → A11 (size it first) → A4 (verify
-first) → A5 (experiment).
+Order: A14 (largest, and it subsumes several tracked items) → A12 (test
+first, one byte) → A11 (size it first) → A4 (verify first) → A5
+(experiment). **A13 is done, #89.** A14 keeps the top slot and #89's captures
+handed it new evidence; see A14 below.
 
 ### A12 (S to test, M to ship): 136 ms of every X3 refresh is controller interval, not drive
 
@@ -123,7 +137,50 @@ rather than inferring them from behaviour.
   classically as border flash or edge ghosting, so this needs a ghosting and
   border soak before it ships, not just a timing capture.
 
-### A13 (S): FastClean's 200 ms trailing settle is charged to the user and nothing follows it
+### A13: LANDED as #89, 2026-09-04
+
+**Predicted −200 ms, measured −199.** Kept in full below because the item was
+right for the reason it gave, and the measurement it demanded is the template
+for the rest of WS-A. What shipped, and what the device said:
+
+- **FastClean `flush_ms` 681 → 482** median on an X3 (p95 726 → 482, n=26
+  before and 50 after). The pre-#89 median was 681 rather than the 686 quoted
+  below, re-taken on today's `main` because the 686 predates #79 through #88.
+- **Every control held.** `busy_ms` 456 both sides with min equal to max
+  across 76 samples, so no waveform, register or wire byte moved. Prestage 24
+  both sides with min equal to max, so the interval was deferred rather than
+  dropped. Fast untouched at 405 flush and 379 busy. Page turn 426 → 427.
+- **The kill condition, answered.** The tail was to be shown as the timer and
+  nothing else. `flush` minus `busy`: Fast 26 ms before and after; FastClean
+  226 ms before, 26 ms after. A clean flush now carries exactly a fast turn's
+  overhead.
+- **The power-on clean path saved the same 200 ms**, 808 → 608, so
+  `CLEAN_POWER_ON_STEPS` is covered as well as `CLEAN_POWERED_STEPS`. That is
+  the wake, and it is a call site that holds the interval in place rather
+  than deferring it, since no prestage follows a wake's first flush.
+- **X3 only, by construction.** Of `SETTLE_MS`'s four uses in the step
+  tables, the two in `FULL_STEPS` and `FULL_POWERED_STEPS` are mid-plan and
+  stay awaited inside the flush. The X4's FastClean is a separate path
+  (`display_flush/ssd1677.rs`) that ends on a completed BUSY wait and owes
+  nothing.
+- **Cost:** +128 B `.bss` on both boards for the extra await points, 1:1
+  against the main stack. X3 region 38,320 → 38,192 B.
+
+Two device observations from those captures, neither caused by #89:
+
+- **A cold boot's Full is followed 714 ms later by a FastClean of the
+  identical view and page, and a wake's first FastClean by another 714 ms
+  later.** Identical on both builds. This is A14's case, now with numbers.
+- **The clean transition flashes bright white and relaxes back.** The HALF
+  bank is an absolute drive (WW==BW at 0xAA/0xA0, WB==BB at 0x55/0x50, 25
+  frames regardless of what is on the glass), so white-target pixels are
+  pushed past the settled paper tone. Pre-existing and confirmed on `main`.
+  #89 makes it *more noticeable* only because `Settled` no longer sits behind
+  the 200 ms the ink relaxes in. The electrical interval is preserved in
+  full. Worth knowing before anyone reads a future clean-path change as
+  having introduced it.
+
+The original item follows, unedited.
 
 `SETTLE_MS = 200` (`display/src/epd/uc8253.rs:192`) is the **last** step of
 both `CLEAN_POWERED_STEPS` and `CLEAN_POWER_ON_STEPS`, awaited inside `flush`,
@@ -184,6 +241,21 @@ can never disagree with `prev_fb` on the skip path.
   normal session plus a held `Next` at a book's last page. **Kills it:**
   under ~2% of renders are byte-identical outside the already-known cases.
   Also time the compare; over ~5 ms, revisit.
+- **Partial evidence arrived free with #89, 2026-09-04, and it favours A14.**
+  Two `reader-soak` captures on an X3, one per build, both show the same
+  duplicate pair: a cold boot's Full followed **714 ms** later by a FastClean
+  of the identical view *and* page, and a wake's first FastClean followed by
+  another 714 ms later. Two of them per boot, on 34 and 57 renders, so ~4-6%
+  of renders in an ordinary session are candidates before the end-of-book
+  case is counted at all. That clears the ~2% floor on its own. The pairs are
+  a *suspicion* rather than a hit, because nothing compared the bytes: the
+  page and view match, and 714 ms is far too regular to be an operator
+  press. So `identical=<bool>` is still the measurement, and it now has a
+  named, reproducible case to confirm against rather than a hunt. **Note the
+  predicate would not skip these as specified**: both are FastClean and the
+  safe predicate restricts to `Fast`. If they turn out byte-identical,
+  either the restriction costs A14 its most common case or the boot and wake
+  double-paint is a separate item.
 
 ### A15 (unresolved — measure before ranking): `fill_plane`'s 528 single-row transfers
 

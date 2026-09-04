@@ -1,9 +1,13 @@
 # PRD: CalendulaOS optimization roadmap
 
-Status: **WS-A reopened**; a new WS-G owns app-state render invalidation;
-the bench harness has an owner for the first time. **Tier 0 is implemented**
-(`opt/tier0-measurement-integrity`) and **the double repaint is merged**
-(#56), so the two largest items in the round are resolved within it.
+Status: **WS-A reopened, and it has now paid out.** **A13 landed as #89 on
+2026-09-04**, the first item shipped since WS-A was reopened and the first
+in this document verified by a before-and-after device capture rather than
+by a single measurement: predicted −200 ms on every FastClean, measured
+−199. A12 is now the top of Tier 1. A new WS-G owns app-state render
+invalidation; the bench harness has an owner for the first time. **Tier 0 is
+implemented** (`opt/tier0-measurement-integrity`) and **the double repaint is
+merged** (#56), so the two largest items in the round are resolved within it.
 Updated 2026-07-30 after a seven-region survey, a branch audit, and a
 code-reviewed implementation of Tier 0. Started 2026-07-09 from six parallel
 code-survey agents, one per workstream, scoped to mostly-disjoint code regions
@@ -33,7 +37,8 @@ sweep changed:
   `SETTLE_MS`, A12's unvaried `CDI_INTERVAL`, the absent frame-identity guard
   behind A14, and C2's untouched sleep path are all still there. WS-A and WS-C
   saw no substantive commits in the interval, so the top of the queue is the
-  part of this document that has aged best.
+  part of this document that has aged best. **A13 has since landed as #89**,
+  measured on device and struck from Tier 1; the other three still stand.
 - **Tier 3 lost its second branch and its clean-merge claim.**
   `opt/upload-session-token` no longer merges.
 - **F11 landed** inside #58 and is struck from item 11. F10 stands.
@@ -132,7 +137,7 @@ is the opposite of what was expected when this started.
 
 | # | Item | WS | Why it ranks here | Effort |
 |---|---|---|---|---|
-| 1 | **A13 — FastClean's 200 ms trailing settle** | A | Measured: `flush_ms` 686 against `busy_ms` 455, and the 204 ms tail is a `DelayMs(200)` whose only job is to precede the *next* RAM write — which already happens after `Settled`. Pure reordering. **−200 ms (−29%) on every view change, every wake, every menu step.** | S |
+| ~~1~~ | ~~**A13, FastClean's 200 ms trailing settle**~~ | A | **LANDED as #89, 2026-09-04.** Predicted −200 ms; measured −199 on an X3 A/B. See Landed. | done |
 | 2 | **A12 — the 136 ms that is not waveform drive** | A | `busy_ms = 136.0 + 12.79 × frames` fits three modes to under 1 ms. 136 ms is **36% of every Fast BUSY** and is controller interval, not drive. Prime suspect is a CDI nibble never varied since the reference driver. **One byte, one capture; potentially ~77–100 ms off every refresh = 18–24% of a page turn.** Test before building. | S to test |
 | 3 | **A14 — frame-identity guard at the flush seam** | A | **G2 shipped as #56**, so the double repaint is gone. A14 remains worth landing: `fb == prev_fb` catches an identical frame from *any* cause — the 62-refresh end-of-book case, the loading plate's duplicate flush, six no-op input sites — and being below the reducer it cannot strand the reader the way an event-layer suppression can. Measure the hit rate first (`identical=<bool>` on `bench: render`); under ~2% outside the known cases, drop it. | S–M |
 | 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. **The "which GPIOs" half now has two named suspects from the 2026-08-06 upstream sweep, so a high reading has somewhere to go: (a) the X3 SD rail on GPIO13 — we drive that pin nowhere and so never cut the card for sleep, and freeink confirmed the pin by factory-firmware RE (`x3-sd-rail-sleep-power`); and (b) the panel RST line floating in deep sleep, closed unmerged as PR #70, which upstream reports as ~36 h-to-dead on a UC8179 while calling the SSD1677 tolerant. Neither is confirmed on our hardware and the gauge cannot separate them, but the card can be removed outright for a control run, making (a) the cheaper one to isolate.** **Sharpened 2026-08-13, then corrected the same day.** Upstream's 12.8 µA X3 figure is measured **with GPIO13 driven low and latched** (`HalPowerManager.cpp:89-90`), so it bounds what the hardware can reach rather than describing a board left alone — which makes the SD rail a *stronger* suspect, not a settled one. Two further findings moved this item: **GPIO13 is the C3's flash SPIWP pad** (so the card powers up because the pin is muxed to flash at boot, not because anything holds it high — a third case neither document had), and **our deep sleep never runs esp-hal's digital-pad isolation pass at all**, because it is gated on a hold bit esp-hal never writes. The latter affects every unheld pad, is the more likely explanation for a high reading, and is investigable today with no hardware. Do that before the 72-hour gauge run. Also: crosspoint `9b1fb712` guards GPIO13 to Xteink C3 boards, so a fix must be board-gated. | S |
@@ -236,6 +241,8 @@ only as the honest home for prestage overlap.
 | **Source identity** | #87 | Not a performance item, listed because it changes two of them. `StagedUpload` hashes every byte it writes (`install.rs:1329`), which puts a streaming SHA-256 on the upload path item 5 measures; and it gives content-derived caches an identity, the one the retired B7's successor keys pagination under |
 | **Physical folder paths** | #88 | Not a performance item, listed because it retired one. A book is addressed by a root-relative locator and its cache key derives from root, locator and byte size rather than from a display label, which is what made B7 unportable. Also catalogs at depth, so WS-B's scan baselines predate it |
 
+| **A13, FastClean's trailing settle** | #89 | **FastClean `flush_ms` 681 to 482 median on an X3, `busy_ms` unchanged at 456, prestage unchanged at 24.** The 200 ms `DelayMs` moved off the reader's wait and onto the caller: it rides on `FlushPlan::settle_after_ms`, comes back through the flush seam as `PanelSettle`, and the display task holds it after `Settled` and before the prestage it guards. The decisive figure is the software tail (`flush` minus `busy`): Fast was and is 26 ms, FastClean was 226 and is now 26, so the tail was the timer and nothing else. Also −200 on the power-on clean path a wake takes (808 to 608) |
+
 Everything above is on `main`. B7 was committed to a branch and retired
 without merging, so it is not listed here; see Tier 3.
 
@@ -308,10 +315,30 @@ Superseded by the table above; kept for the comparison.
 | Reading layout, portrait | **13 ms** median / 14 p95 |
 | Reading layout, landscape | 16–18 ms |
 | Menu / Settings layout | 3–8 ms |
-| Render flush | **405 ms** median (379 ms of it panel BUSY) |
+| Render flush, Fast | **405 ms** median (379 ms of it panel BUSY) |
+| Render flush, FastClean | **482 ms** median (456 ms of it panel BUSY) |
 | Prestage (after the settle; reader never waits) | 24 ms |
 | Progress write | 42 ms |
 | **Page turn, press-to-settled** | **~424 ms** |
+
+**FastClean re-measured 2026-09-04 after #89 (A13), X3, main `b3f11cd`.**
+`flush_ms` 482 median / 482 p95 over 50 samples, `busy_ms` 456 with min equal
+to max, prestage 24 with min equal to max over 57 renders. The pre-#89 figure
+was 681 median / 726 p95, so **quote 482 and not 681 or the roadmap's older
+686.** The Fast row is unchanged and was re-confirmed in the same session at
+405 and 379, which pins the FastClean move to the settle rather than to
+anything else that moved.
+
+Two things that session settled, both worth reading before sizing an A-item:
+
+- **The software tail is 26 ms per flush, in both modes.** `flush` minus
+  `busy` is now 26 ms for Fast and 26 ms for FastClean, where FastClean was
+  226. There is no longer a mode-dependent software overhead on the render
+  path, so a future A-item cannot be sized against one.
+- **`bench.py`'s `render flush` line pools every refresh mode**, which is
+  exactly where A13 lived: a pooled median moved 681 to 482 only because the
+  capture was mostly FastCleans. Split by mode before believing any flush
+  figure. The report gives `refresh modes:` counts to tell you the mix.
 
 **Book pipeline, X3, 11.7 MB baseline book (2026-07-25 / 07-28).**
 **These predate folder browsing.** They were taken against a flat `/BOOKS`
@@ -418,6 +445,25 @@ is X3-only for this reason.
    regeneration — and the mismatch sat under a "reproduction verified" commit
    message for a week. The prove-first habit is what caught it (issue 08,
    H5).
+12. **A pooled statistic hides a mode-specific win, and every flush figure in
+   this project is pooled.** `bench.py`'s `render flush` line covers Fast,
+   FastClean and Full together, so its median tracks the *mix* of a capture
+   as much as any change. On #89's captures the pooled median read 681 to
+   482, which looks like the real result and is not: it moved that far only
+   because the walk was mostly view changes. Split by mode before believing a
+   flush number, and quote the `refresh modes:` counts alongside it so the
+   mix is visible. The same trap is waiting for A12, which moves `busy_ms`
+   across every mode at once, and for A14, which removes whole renders and so
+   changes the mix itself.
+13. **Take the before-capture on today's `main`, not from this document.**
+   #89 was specified against a 686 ms figure recorded before #79 through #88.
+   Re-taken on current `main` in the same session, on the same card and book,
+   it was 681. Close enough that the item was safe, which is luck rather than
+   method: a 5 ms drift over ten merges could as easily have been 50, and it
+   would have been credited to the change. An A/B in one session also makes
+   the controls worth something, since `busy_ms` and prestage holding to the
+   millisecond only means anything when both sides ran on the same hardware
+   minutes apart.
 
 ## Workstreams
 
