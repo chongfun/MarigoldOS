@@ -815,6 +815,52 @@ per book. Positions and caches still key by place; moving them onto `BookId`
 is the next milestone, together with the position-format migration in the
 reading-position work.
 
+A managed replacement, an upload landing under a name the shelf already
+holds, is the one case where a copy's bytes change under its id, and it
+spans two transactions: `INSTALL.JNL` swaps the bytes, and the ledger has to
+be told. `/READER/REPLACE.JNL` bridges them. Before the installer writes
+`INSTALL.JNL` it publishes an intent there naming the copy's id, the place
+the install lands spelled as typed, what stood there (nothing, a predecessor
+whose bytes were not read, or one whose digest was read in this session) and
+the exact spelling it stood under, and the digest of the bytes staged to
+land; the intent stands after `INSTALL.JNL` clears and is cleared only once
+the ledger record has been rewritten under the same id with the new size and
+digest. What the ledger recorded of the predecessor's bytes is not promoted
+into the intent: a computer may have replaced the file with another of the
+same size between transactions, which the ledger cannot see, so the
+installer says "unknown" and only a caller that hashed the predecessor says
+"known". Recovery resolves the intent after the filesystem journals have
+settled, and asks the card rather than the record which side won, by hashing
+the destination: the new digest is decisive; a known predecessor is
+recognised by its digest; an unknown one as any file that is not the new
+bytes, which the sole-writer contract makes sufficient; and where nothing
+stood, nothing standing is the old landing. Anything else keeps the intent
+and refuses, and while it stands no scan adopts and no other change to the
+shelf begins. In the session that ran the install the landing is known from
+the install's own proof that the destination is on its chain, so nothing is
+hashed twice. Names match by FAT's rules on the card and exactly in the
+ledger, so an upload spelled another way replaces the copy the installer
+found and respells its place, and a rollback puts the predecessor back under
+the spelling typed; settling moves the record to whichever spelling the file
+ends up under. A book with no long name is found by its rendered alias, the
+name a listing shows it under and the locator the library adopts it by, so
+it is replaced under that name and keeps its id like any other. Anything
+else answering to the name where the upload would land refuses it before
+anything is journalled or moved: two entries answering alike, whichever of
+them the upload spells, or a folder carrying the name, which unpacking an
+EPUB on a computer leaves behind. FAT gives a directory one namespace over
+long names and aliases together, with case ignored, so the landing would be
+refused by whichever the install had not taken, and the rollback after it,
+halfway through. A ledger with no room for a fresh copy's record lets a
+missing copy go to make it, chosen when the intent is published from the
+records the last scan found missing and verified absent then, which the
+sole-writer contract keeps true while it stands; with none to let go of, the
+install refuses before anything is journalled. The file is two slots like
+the ledger journal, so a torn publication is an install that has not begun
+and a torn clear is an intent resolved again. No id or digest enters
+`INSTALL.JNL` or `RECLAIM.JNL`: the filesystem transaction decides what the
+card holds, and this one records what that means for identity.
+
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN
 /READER/CACHE2/E<hash>/TOC.BIN
@@ -828,6 +874,7 @@ reading-position work.
 /READER/LEDGERA.BIN
 /READER/LEDGERB.BIN
 /READER/PROBE.TXT
+/READER/REPLACE.JNL
 /READER/ROLLBACK/<txn>
 /READER/UPLOAD/<txn>
 /READER/STATEA.BIN
