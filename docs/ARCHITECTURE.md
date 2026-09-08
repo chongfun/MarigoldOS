@@ -477,19 +477,6 @@ page turns differ by controller:
 - **X3 (UC8253)**: Uploads the firmware-defined `HALF` LUT bank in absolute CDI
   mode — a similar short clean without temperature overrides.
 
-The X3's clean plans also owe the panel 200 ms of quiet before its RAM is
-written again. Nothing in the plan follows that interval, so it rides on
-`FlushPlan::settle_after_ms` instead of being the flush's last step, and the
-caller holds it: the display task reports the frame, waits, then prestages,
-which is the write the interval guards. The gap is unchanged, only which side
-of `DisplayEvent::Settled` it falls on, and that takes it off press-to-settled
-on every view change, wake and menu step. A plan is therefore not finished when
-its steps are, and a caller that drops the interval rather than deferring it is
-the one way to get this wrong: the emulator's panel model refuses a RAM write
-while an unheld settle stands, and in firmware the returned `PanelSettle` is a
-bound variable, so deleting the wait fails the build. Neither guard reaches the
-other's call site.
-
 Waking from the sleep screen and view/context changes use `FastClean`
 instead of the full waveform, since the panel's contents are known.
 
@@ -699,10 +686,10 @@ that did not come from resolving a row carry no fence, since their index comes
 from the app's own active book and refusing those would refuse a boot restore
 whose scan the app has not folded yet.
 
-Behind that list, `/READER/CATALOG.BIN` (v9: `X4CT` magic, u16 book count,
-419-byte records) is the whole book set, and stays the source of identity, the
-orphan sweep's ledger, the wifi shelf listing, and what a chosen locator
-resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
+Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
+435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
+book set, and stays what the orphan sweep judges against, the wifi shelf
+listing, and what a chosen locator resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
 instead of holding the whole list in RAM, so library size is bounded by the
 card. That count field is also the library's
 ceiling: 65,535 books. A card holding more fails the scan rather than
@@ -768,6 +755,66 @@ against that arrival: the candidate search, the verdict rule that refuses
 every inference available today, `carry_position`, and the version 2 claim
 that has somewhere to put evidence. None of them runs on the card.
 
+That record now exists, though nothing hangs from it yet. The library ledger,
+`/READER/LEDGERA.BIN` and `LEDGERB.BIN`, adopts every physical EPUB the scan
+catalogues under a `BookId`: sixteen random bytes from the hardware RNG,
+minted once, derived from nothing on the card, and bound by the ledger to the
+root, locator and size the copy had when it was adopted (`proto::identity`,
+`upload_store::ledger`). Every catalog row caches its id, so the reading path
+does not open the ledger. A catalog rebuild joins its fresh rows to the
+ledger by place: a row a live record names by root, locator and size keeps
+that record's id, every other row is minted one, and the new records are
+committed as a ledger generation before the catalog header lands, so no
+committed row carries an id the ledger could lose. Two byte-identical files
+are two ids with independent state. A copy moved on a computer is a new id
+to this milestone, and the record of the copy that left stays as a missing
+book for the reconciliation that will match it by digest. Each record counts
+the consecutive scans its place has been missing; a missing record is carried
+for eight such scans and then left out, and missing records are the first to
+go when a generation would not fit beside the live library, so the ledger
+stays near the size of the library rather than of every book that ever
+passed through it. A card emptied of books is a scan with no rows, and it
+ages every record the same way. A scan that changes nothing writes nothing.
+
+The ledger is durable state where the catalog is a cache, so it is written
+the way positions are: whole, to the side that is not live. Records go down
+under an all-zero placeholder header and the file is closed at its final
+length; then the real header is written over the placeholder in a second
+open, so a generation with a header is a generation with all of its records.
+Which side is live is kept in a third file, `/READER/LEDGER.JNL`. While a
+rewrite lays the target's records down it still names the side that stands,
+so whatever the target held before is not consulted; once the records are
+down it says which side is being written and what stood on the other; and
+after the new header has landed and read back it says which side is live and
+what its header is. The journal is two sector-sized slots written
+alternately with a sequence number, as `RECLAIM.JNL` is, so a write torn by
+a power cut damages the slot being written and the entry before it still
+reads; falling back one entry is safe because a generation's ids reach a
+committed catalog only after the journal has named it live. A torn write of
+a target's header reads the same way: under a journal that says the side is
+being written, a target that is not the committed, whole generation expected
+is a commit that did not land. A reader believes only what the journal
+accounts for. The side it names as
+live must hold the header it recorded; during a rewrite, the target is live
+if its header landed with the generation after the one that stood, and
+otherwise the side that stood is, if it still holds exactly what was
+recorded. The generation chosen is then checked for length and every record.
+Anything else refuses: a live side that is empty, missing, or under another
+header, a header or journal this build did not write, a header or journal
+of a version it does not read, or ledger files with no journal beside them.
+Those states are the loss of durable identity rather than an interrupted
+write, and the side that is not live is missing every id the live one added,
+so taking it would re-mint those and orphan whatever comes to hang from
+them. The scan asks the ledger before it touches the catalog, so a refusal
+leaves the committed catalog serving the shelf as it was and stops only
+rebuilds, until the intact records are salvaged by something explicit. The join stages six-byte `(hash, row)` keys
+in the scan arena behind one bit per ledger record and reads the ledger once
+per 2,730 rows, so a rebuild costs one sequential pass over the ledger plus
+one row read and one 16-byte write per matched row, rather than a file open
+per book. Positions and caches still key by place; moving them onto `BookId`
+is the next milestone, together with the position-format migration in the
+reading-position work.
+
 ```text
 /READER/CACHE2/E<hash>/BOOK.BIN
 /READER/CACHE2/E<hash>/TOC.BIN
@@ -778,6 +825,8 @@ that has somewhere to put evidence. None of them runs on the card.
 /READER/CATALOG.BIN
 /READER/INSTALL.JNL
 /READER/LABELS/<stem>.TXT
+/READER/LEDGERA.BIN
+/READER/LEDGERB.BIN
 /READER/PROBE.TXT
 /READER/ROLLBACK/<txn>
 /READER/UPLOAD/<txn>

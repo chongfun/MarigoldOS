@@ -550,19 +550,15 @@ impl Emulator {
             );
         }
         let mode = self.refresh_planner.mode_for(request);
-        let flushed = self
+        let effective_mode = self
             .panel
             .flush(&self.fb, &self.prev_fb, mode, self.prev_prestaged)
             .expect("panel flush");
         self.refresh_planner.record_render(request, mode);
         self.prev_fb.copy_from(&self.fb);
-        // The firmware's order (`fw::tasks::display`): report the frame, then
-        // hold the interval, then prestage. The model rejects a plane write
-        // taken inside it, so dropping this line fails the panel tests.
-        self.panel.settle(flushed.settle_ms).expect("panel settle");
         // A Full flush already writes the old/RED plane with the current
         // frame, so staging it again here would just repeat that write.
-        self.prev_prestaged = flushed.effective_mode == display::epd::RefreshMode::Full
+        self.prev_prestaged = effective_mode == display::epd::RefreshMode::Full
             || self.panel.prestage_previous(&self.fb).is_ok();
     }
 
@@ -573,8 +569,7 @@ impl Emulator {
             &self.library_entries,
             &self.library_folder,
         );
-        let flushed = self
-            .panel
+        self.panel
             .flush(
                 &self.fb,
                 &self.prev_fb,
@@ -584,10 +579,6 @@ impl Emulator {
             .expect("panel sleep flush");
         self.prev_fb.copy_from(&self.fb);
         self.prev_prestaged = false;
-        // Zero for a Full plan, held anyway so this stays the plan's fact.
-        self.panel
-            .settle(flushed.settle_ms)
-            .expect("panel sleep settle");
         self.panel.deep_sleep().expect("panel deep sleep");
         self.refresh_planner.record_sleep(true);
     }
