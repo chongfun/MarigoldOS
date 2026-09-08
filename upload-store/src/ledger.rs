@@ -85,7 +85,7 @@ use proto::identity::{
     LEDGER_HEADER_BYTES, LEDGER_JOURNAL_BYTES, LEDGER_JOURNAL_SLOTS, LEDGER_JOURNAL_SLOT_BYTES,
     LEDGER_RECORD_BYTES, ROW_KEY_BYTES,
 };
-use proto::library_path::BookRoot;
+use proto::library_path::{BookRoot, MAX_PATH_BYTES};
 use proto::source::CachedSourceDigest;
 
 /// The two generations, under the cache root.
@@ -330,6 +330,111 @@ where
     Ok(found)
 }
 
+/// The copy a [`BookId`] names, as the ledger has it.
+///
+/// Owned rather than borrowed like [`LedgerRecord`]: a caller resolving an
+/// id is between reads, and a borrowed record points into the buffer the
+/// next read fills.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryCopy {
+    /// Where the copy sits: the root its locator is relative to, and the
+    /// locator spelled exactly as the card spells it.
+    ///
+    /// `None` is a record with no place to give. Not the same thing as a
+    /// place that is empty, which a missing copy has and which the copy can
+    /// come back to: it is a record whose place another id holds, so what
+    /// it says about the card describes another copy's file. Handing that
+    /// back is how state belonging to one copy would be resolved against
+    /// another, which is worse than losing the copy. The record stays in
+    /// the ledger to be matched by its bytes or aged out; what it says
+    /// about the card is what stops being evidence.
+    pub place: Option<(BookRoot, heapless::String<MAX_PATH_BYTES>)>,
+    pub byte_size: u32,
+    /// Consecutive scans that have not found it. Zero is a copy the last
+    /// scan saw; anything else is a copy whose card may simply have been
+    /// out, which is why a record with misses still answers here.
+    pub misses: u8,
+    pub source: Option<CachedSourceDigest>,
+}
+
+impl LibraryCopy {
+    /// Where the copy sits, spelled exactly as the card spells it, when the
+    /// ledger has a place to give for it.
+    pub fn locator(&self) -> Option<&str> {
+        self.place.as_ref().map(|(_, locator)| locator.as_str())
+    }
+}
+
+/// Where the copy `id` names is now, or `None` when no record carries that
+/// id.
+///
+/// The reverse of [`find_record`], and the direction per-copy user state is
+/// addressed by: a reading position hangs from an id, and resuming it means
+/// asking which file that id is, wherever it has been moved or renamed to
+/// since. A locator answers the other question, which file this is, and the
+/// two meet in the catalog row that caches both.
+///
+/// A place is handed back only if it is this record's to give. A place
+/// belongs to the record the last scan matched to it, which is the record
+/// with no misses: the scan matches a row by root, locator and size, gives
+/// the row to one record, and ages every record it did not match. So a
+/// record with misses whose place another record holds with none is a
+/// record describing a file that answers to another id, and it is told
+/// nothing rather than told that.
+///
+/// It is a place with different bytes at it that gets there, which an
+/// ordinary card edit reaches: a book replaced on a computer by one of
+/// another size is a row the old record no longer matches, so the row is
+/// minted an id of its own and the old record is carried as missing at the
+/// name the new copy now holds. Two records naming one place with one size,
+/// which this crate's writers do not produce, resolves the same way, the
+/// scan having matched exactly one of them.
+///
+/// A record with no misses is the owner of its place, so the check runs
+/// only for the others, and resolving a live copy still reads the ledger
+/// once.
+pub fn find_by_id<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    root: &Directory<'_, D, T, MD, MF, MV>,
+    ledger: &Ledger,
+    id: BookId,
+) -> Result<Option<LibraryCopy>, LedgerFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut found: Option<(BookRoot, heapless::String<MAX_PATH_BYTES>, u32, u8)> = None;
+    let mut source = None;
+    for_each_record(root, ledger, &mut |_, record| {
+        if found.is_some() || record.id != id {
+            return Ok(());
+        }
+        let mut locator = heapless::String::new();
+        locator
+            .push_str(record.locator)
+            .map_err(|_| LedgerFault::Record)?;
+        source = record.source;
+        found = Some((record.root, locator, record.byte_size, record.misses));
+        Ok(())
+    })?;
+    let Some((at, locator, byte_size, misses)) = found else {
+        return Ok(None);
+    };
+    let mut held_by_another = false;
+    if misses > 0 {
+        for_each_record(root, ledger, &mut |_, record| {
+            held_by_another |=
+                record.misses == 0 && record.root == at && record.locator == locator.as_str();
+            Ok(())
+        })?;
+    }
+    Ok(Some(LibraryCopy {
+        place: (!held_by_another).then_some((at, locator)),
+        byte_size,
+        misses,
+        source,
+    }))
+}
+
 /// What a carried record is written with when it keeps its id, root and
 /// locator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -545,6 +650,10 @@ where
 /// it. It is a whole generation rewrite, which is what every change to the
 /// ledger is, and is committed before this returns.
 ///
+/// The place published belongs to this record afterwards: any other record
+/// naming it is dropped, since one file sits at a place and the caller has
+/// just proved which copy that is.
+///
 /// A generation with no room for one more record can make it only by letting
 /// `evict` go, a record the caller chose and verified against the card;
 /// nothing here decides which copy is disposable. A full ledger with no
@@ -593,6 +702,16 @@ where
             } else if entry.id == record.id {
                 replaced.set(true);
                 Carry::Replace(published)
+            } else if entry.root == record.root && entry.locator == record.locator {
+                // Another id claiming the place this copy has just been
+                // proved to hold. One file sits at a place, so the claim is
+                // contradicted by the proof: a book deleted on a computer
+                // and uploaded again lands under a fresh id at the name its
+                // predecessor's record still names, and carrying both would
+                // leave two ids answering for one file for ever, with the
+                // scan's join picking between them by ledger order rather
+                // than by evidence.
+                Carry::Drop
             } else {
                 Carry::Keep(Kept::of(entry))
             }
@@ -608,7 +727,8 @@ where
 
 /// Move the record with `id` to another place, keeping its size, digest and
 /// id. For a copy that a managed transaction respelled or moved. A ledger
-/// with no such record is left as it is.
+/// with no such record is left as it is, and any other record naming the
+/// place moved to is dropped, as in [`publish_record`].
 pub fn relocate_record<D, T, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
     ledger: Ledger,
@@ -639,6 +759,11 @@ where
                     misses: 0,
                     ..*entry
                 })
+            } else if entry.root == at && entry.locator == locator {
+                // The place this copy is moving to, claimed by another id.
+                // One file sits at a place, and the caller has just seen
+                // which copy that is; see [`publish_record`].
+                Carry::Drop
             } else {
                 Carry::Keep(Kept::of(entry))
             }
@@ -753,11 +878,19 @@ where
                     {
                         continue;
                     }
-                    names_a_row = true;
                     if catalog_record_book_id(&record).is_some() {
+                        // Another record has already taken this row: two ids
+                        // for one place, which this writer cannot produce
+                        // and one file cannot answer to. The first in ledger
+                        // order keeps the row, deterministically, and this
+                        // one is not counted as naming anything, so it ages
+                        // out like any other record whose place is not
+                        // there and the ledger comes back to one id per
+                        // copy on its own.
                         assigned.duplicates = assigned.duplicates.saturating_add(1);
                         continue;
                     }
+                    names_a_row = true;
                     write_row_id(catalog, row as usize, entry.id)?;
                     assigned.matched += 1;
                 }

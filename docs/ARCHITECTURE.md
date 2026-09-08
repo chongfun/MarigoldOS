@@ -807,13 +807,48 @@ write, and the side that is not live is missing every id the live one added,
 so taking it would re-mint those and orphan whatever comes to hang from
 them. The scan asks the ledger before it touches the catalog, so a refusal
 leaves the committed catalog serving the shelf as it was and stops only
-rebuilds, until the intact records are salvaged by something explicit. The join stages six-byte `(hash, row)` keys
-in the scan arena behind one bit per ledger record and reads the ledger once
-per 2,730 rows, so a rebuild costs one sequential pass over the ledger plus
-one row read and one 16-byte write per matched row, rather than a file open
-per book. Positions and caches still key by place; moving them onto `BookId`
-is the next milestone, together with the position-format migration in the
-reading-position work.
+rebuilds, until the intact records are salvaged by something explicit. The
+join stages six-byte `(hash, row)` keys in the scan arena behind one bit per
+ledger record and reads the ledger once per 2,730 rows, so a rebuild costs
+one sequential pass over the ledger plus one row read and one 16-byte write
+per matched row, rather than a file open per book.
+
+A place has one file, so the copy at it has one id: publishing a record for
+a place, or moving one to it, drops any other record naming it, since the
+caller has just proved which copy is there. Without that, a book deleted on
+a computer and uploaded again left the deleted copy's record naming the name
+the upload had just taken, and both records stayed live for ever, with the
+scan choosing between them by ledger order rather than by evidence. A ledger
+that arrives with a place named twice anyway, which this writer does not
+produce, gives the row to the first record in ledger order and stops
+treating the other as naming anything, so it ages out on the ordinary
+retention schedule and the ledger comes back to one id per copy on its own.
+While it lasts, that record has no place to give, and neither has the
+record of a book a computer replaced with one of another size, which is the
+ordinary way to reach the same shape: the row stops matching the old record
+and is minted an id of its own, so the old record is carried as missing at a
+name the new copy holds. Asking where the displaced id is answers with
+nothing rather than with the other copy's file, while the id that holds the
+place answers with it. A place belongs to the record the last scan matched
+to it, which is the record with no misses, and a place another id holds is
+not an empty place a copy can come back to. Resolving one copy's state
+against another copy's book is the merge that costs more than the copy.
+Both records stay in the ledger, to be matched by their bytes or aged out
+with everything else the card stopped holding. Two records that are both
+missing keep their places, neither being the one a scan chose.
+
+Positions and caches still key by place, and the mapping they will move onto
+is what exists now: a place resolves to the id that owns it
+(`upload_store::ledger::find_record`), an id resolves to wherever that copy
+has got to (`find_by_id`), and the open book carries its id in RAM beside
+its locator (`ReaderStore::active_copy_id`), so a rename moves the answer
+without changing the question and a copy the last scan missed still answers,
+saying how many scans have missed it. Two byte-identical copies are two ids
+whose records, sizes and digests move independently, and whose positions are
+filed apart because a cache directory is named for a place. The format
+change that files a position under its id belongs to the reading-position
+work, which moves the page index onto a content anchor in the same
+migration: one migration of the position file rather than two.
 
 A managed replacement, an upload landing under a name the shelf already
 holds, is the one case where a copy's bytes change under its id, and it

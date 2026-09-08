@@ -1539,11 +1539,16 @@ fn a_missing_copy_is_retained_for_a_bounded_number_of_scans() {
     );
 }
 
-/// Two live records naming one place is a ledger this writer did not
-/// produce. The first in ledger order wins, every time, and the caller is
-/// told.
+/// Two live records naming one place is a ledger this writer does not
+/// produce: one file sits at a place, and the copy there has one id. The
+/// first in ledger order takes the row, every time, and the caller is told;
+/// the record that lost is not treated as naming anything, so it ages out
+/// like any other record whose place is not there and the ledger comes back
+/// to one id per copy on its own. Carrying both as live was the earlier
+/// behaviour, and it left two ids answering for one file for ever, which is
+/// two owners for whatever state hangs from an id.
 #[test]
-fn a_place_named_twice_takes_the_first_record_and_reports_it() {
+fn a_place_named_twice_takes_the_first_record_and_ages_out_the_other() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
@@ -1570,21 +1575,161 @@ fn a_place_named_twice_takes_the_first_record_and_reports_it() {
     )
     .unwrap();
 
-    let (assigned, ids) = scan(&root, &[row], ARENA, &mut entropy(), || {}).unwrap();
+    let mut random = entropy();
+    let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
     assert_eq!(
         assigned,
         Assignment {
             matched: 1,
             duplicates: 1,
+            missing: 1,
             ..Assignment::default()
         }
     );
     assert_eq!(ids, vec![Some(first)]);
-    // Both records named a live row, so both are carried, and nothing is
-    // written for a card that has not changed.
-    let settled = generation(&root);
-    let (assigned, _) = scan(&root, &[row], ARENA, &mut entropy(), || {}).unwrap();
-    assert_eq!(assigned.duplicates, 1);
-    assert_eq!(generation(&root), settled);
+    assert_eq!(records(&root).len(), 2, "the other is a scan older");
+
+    // And the shadowed record has no place to give while it lasts. Its
+    // locator is the winner's file, so answering with it would resolve one
+    // copy's state against another's book, which is the merge that costs
+    // more than the copy.
+    let live = ledger::open(&root).unwrap().unwrap();
+    let winner = ledger::find_by_id(&root, &live, first).unwrap().unwrap();
+    assert_eq!(winner.locator(), Some(row.1), "the row's id names the file");
+    assert_eq!(winner.misses, 0);
+    let loser = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(loser.place, None, "the place it names is not its own");
+    assert_eq!(
+        loser.byte_size, row.2,
+        "the record is still there to salvage"
+    );
+    assert_eq!(loser.misses, 1);
+
+    // Every scan reads it the same way and ages the shadowed record once
+    // more, until the retention window runs out.
+    for _ in 1..MISSING_SCANS_RETAINED {
+        let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
+        assert_eq!(assigned.duplicates, 1);
+        assert_eq!(ids, vec![Some(first)], "the row's id stays where it was");
+        let live = ledger::open(&root).unwrap().unwrap();
+        assert_eq!(
+            ledger::find_by_id(&root, &live, second)
+                .unwrap()
+                .unwrap()
+                .place,
+            None,
+            "and still has no place to give"
+        );
+    }
     assert_eq!(records(&root).len(), 2);
+
+    let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.retired, 1, "the last scan it is carried for");
+    assert_eq!(assigned.duplicates, 1, "read once more on its way out");
+    assert_eq!(ids, vec![Some(first)]);
+    assert_eq!(ids_of(&records(&root)), vec![first], "one copy, one id");
+    let live = ledger::open(&root).unwrap().unwrap();
+    assert_eq!(
+        ledger::find_by_id(&root, &live, second).unwrap(),
+        None,
+        "the id it carried names nothing at all now"
+    );
+    assert_eq!(
+        ledger::find_by_id(&root, &live, first)
+            .unwrap()
+            .and_then(|copy| copy.locator().map(str::to_owned)),
+        Some(row.1.to_owned()),
+        "and the copy that kept the place still answers with it"
+    );
+
+    // And the card settles: nothing shadows the row, and nothing is written
+    // for a card that has not changed.
+    let settled = generation(&root);
+    let (assigned, ids) = scan(&root, &[row], ARENA, &mut random, || {}).unwrap();
+    assert_eq!(assigned.duplicates, 0);
+    assert_eq!(ids, vec![Some(first)]);
+    assert_eq!(generation(&root), settled);
+}
+
+/// An id is what per-copy state hangs from, so the ledger has to answer the
+/// question that state asks: which file is this id, now. A rename moves the
+/// answer without changing the question, which is the whole point of
+/// keeping ids off the path.
+#[test]
+fn an_id_answers_with_the_copy_it_names_wherever_that_copy_has_moved() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let rows = [
+        (BookRoot::Library, "Dune.epub", 3_000),
+        (BookRoot::Library, "Emma.epub", 2_000),
+    ];
+    let (_, ids) = scan(&root, &rows, ARENA, &mut entropy(), || {}).expect("scan");
+    let dune = ids[0].expect("adopted");
+    let emma = ids[1].expect("adopted");
+
+    let live = ledger::open(&root).expect("open").expect("a ledger");
+    let copy = ledger::find_by_id(&root, &live, dune)
+        .expect("read")
+        .expect("the id names a copy");
+    assert_eq!(
+        copy.place.as_ref().map(|(at, _)| *at),
+        Some(BookRoot::Library)
+    );
+    assert_eq!(copy.locator(), Some("Dune.epub"));
+    assert_eq!(copy.byte_size, 3_000);
+    assert_eq!(copy.misses, 0, "the scan just saw it");
+    assert_eq!(copy.source, None, "a sideloaded copy's bytes were not read");
+    assert_eq!(
+        ledger::find_by_id(&root, &live, BookId::from_bytes([7u8; 16]).unwrap()).expect("read"),
+        None,
+        "an id nothing carries names nothing"
+    );
+
+    // The copy moves into a folder. Its record follows the file; the id it
+    // is asked about does not change.
+    let live = ledger::relocate_record(&root, live, dune, BookRoot::Library, "Fiction/Dune.epub")
+        .expect("relocate");
+    let copy = ledger::find_by_id(&root, &live, dune)
+        .expect("read")
+        .expect("the same id, the new place");
+    assert_eq!(copy.locator(), Some("Fiction/Dune.epub"));
+    assert_eq!(copy.byte_size, 3_000);
+    let other = ledger::find_by_id(&root, &live, emma)
+        .expect("read")
+        .expect("the other copy is where it was");
+    assert_eq!(other.locator(), Some("Emma.epub"));
+}
+
+/// A card can be taken out, edited, and put back, so a copy the last scan
+/// did not find is not a copy whose state is gone. Its id still answers,
+/// and says how many scans have missed it.
+#[test]
+fn a_copy_the_scan_missed_still_answers_to_its_id() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut random = entropy();
+    let rows = [
+        (BookRoot::Library, "Dune.epub", 3_000),
+        (BookRoot::Library, "Emma.epub", 2_000),
+    ];
+    let (_, ids) = scan(&root, &rows, ARENA, &mut random, || {}).expect("scan");
+    let dune = ids[0].expect("adopted");
+
+    // The next scan runs with the book off the card.
+    scan(
+        &root,
+        &[(BookRoot::Library, "Emma.epub", 2_000)],
+        ARENA,
+        &mut random,
+        || {},
+    )
+    .expect("scan");
+    let live = ledger::open(&root).expect("open").expect("a ledger");
+    let copy = ledger::find_by_id(&root, &live, dune)
+        .expect("read")
+        .expect("a missing copy still answers");
+    assert_eq!(copy.locator(), Some("Dune.epub"), "where it last was");
+    assert_eq!(copy.misses, 1);
 }

@@ -21,7 +21,7 @@ use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, Mode, TimeSource, Timestamp, VolumeIdx,
     VolumeManager,
 };
-use proto::cache::{source_hash_at, CACHE_ROOT_DIR, CATALOG_FILE};
+use proto::cache::{cache_key_from, source_hash_at, CACHE_ROOT_DIR, CATALOG_FILE};
 use proto::catalog::{
     catalog_record_book_id, encode_catalog_header, encode_catalog_placeholder_header,
     encode_catalog_record, CATALOG_HEADER_BYTES, CATALOG_RECORD_BYTES,
@@ -301,6 +301,16 @@ fn scan(
     root: &Dir<'_>,
     rows: &[Row<'_>],
 ) -> Result<(Assignment, Vec<Option<BookId>>), LedgerFault> {
+    scan_minting(root, rows, &mut words())
+}
+
+/// [`scan`], minting from `random` rather than the fixed word source: two
+/// scans of one card that both mint must not draw the same id twice.
+fn scan_minting(
+    root: &Dir<'_>,
+    rows: &[Row<'_>],
+    random: &mut impl FnMut() -> u32,
+) -> Result<(Assignment, Vec<Option<BookId>>), LedgerFault> {
     if root.open_dir(CACHE_ROOT_DIR).is_err() {
         root.make_dir_in_dir(CACHE_ROOT_DIR).expect("mkdir READER");
     }
@@ -327,14 +337,8 @@ fn scan(
     }
     let live = ledger::open(root)?;
     let mut scratch = vec![0u8; 16 * 1024];
-    let assigned = ledger::assign_book_ids(
-        root,
-        &file,
-        rows.len() as u16,
-        &mut scratch,
-        &mut words(),
-        live,
-    )?;
+    let assigned =
+        ledger::assign_book_ids(root, &file, rows.len() as u16, &mut scratch, random, live)?;
     encode_catalog_header(rows.len() as u16, &mut header);
     file.seek_from_start(0).map_err(|_| LedgerFault::Device)?;
     file.write(&header).map_err(|_| LedgerFault::Device)?;
@@ -1742,4 +1746,226 @@ fn a_folder_answering_like_the_book_is_refused_before_the_book_is_parked() {
         "and its record is as it was"
     );
     assert_eq!(record_count(&root), 1);
+}
+
+/// A reader may keep two copies of one book on purpose, and the two are
+/// separate books to the library however identical their bytes: one id
+/// each, one record each, and state that stays where it was put. Reading
+/// one does not move the other, which today means their positions are filed
+/// in cache directories of their own.
+#[test]
+fn two_identical_copies_are_two_ids_with_state_of_their_own() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let shared = body(1, 3_000);
+    let size = shared.len() as u32;
+    let twin = "Dune (2).epub";
+    sideload(&books, BOOK, &shared);
+    sideload(&books, twin, &shared);
+    let (assigned, ids) = scan(
+        &root,
+        &[
+            (BookRoot::Library, BOOK, size),
+            (BookRoot::Library, twin, size),
+        ],
+    )
+    .unwrap();
+    assert_eq!(assigned.minted, 2);
+    let (first, second) = (ids[0].unwrap(), ids[1].unwrap());
+    assert_ne!(first, second, "identical bytes, two library entries");
+    assert_eq!(
+        digest_of(&shelf_bytes(&root, BOOK).unwrap()),
+        digest_of(&shelf_bytes(&root, twin).unwrap()),
+        "and one source digest between them"
+    );
+
+    let live = ledger::open(&root).unwrap().unwrap();
+    let one = ledger::find_by_id(&root, &live, first).unwrap().unwrap();
+    let other = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(one.locator(), Some(BOOK), "each id names its own copy");
+    assert_eq!(other.locator(), Some(twin));
+    assert_ne!(
+        cache_key_from(source_hash_at(BookRoot::Library, BOOK, size)),
+        cache_key_from(source_hash_at(BookRoot::Library, twin, size)),
+        "and their state is filed apart"
+    );
+
+    // Replacing one is a change to that copy alone: the other keeps its id,
+    // its place, its size and what the ledger says of its bytes.
+    let newer = body(2, 4_100);
+    upload(&root, &books, BOOK, &newer, || {})
+        .unwrap()
+        .expect("lands");
+    assert_eq!(
+        record_for(&root, BOOK).map(|(id, size, _)| (id, size)),
+        Some((first, newer.len() as u32)),
+        "the copy that was replaced kept its id and took the new size"
+    );
+    let live = ledger::open(&root).unwrap().unwrap();
+    let other = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(other.locator(), Some(twin));
+    assert_eq!(other.byte_size, size);
+    assert_eq!(other.source, None, "nothing was said about the other copy");
+    assert_eq!(
+        shelf_bytes(&root, twin).as_deref(),
+        Some(&shared[..]),
+        "and its bytes are where they were"
+    );
+
+    // A third copy of those same bytes arriving as an upload is a third
+    // entry rather than a match onto either: same digest, same size as the
+    // twin, and an id of its own.
+    // Two mints have already come off the fixture's word source, one per
+    // copy, and an id is four draws.
+    let mut later = words();
+    for _ in 0..8 {
+        later();
+    }
+    upload_minting(&root, &books, "Third.epub", &shared, &mut later)
+        .unwrap()
+        .expect("lands");
+    let (third, third_size, third_source) = record_for(&root, "Third.epub").expect("adopted");
+    assert!(![first, second].contains(&third), "a third id");
+    assert_eq!(third_size, size);
+    assert!(
+        digest_agrees(third_source, &shared),
+        "the bytes the twin holds, recorded under an id of its own"
+    );
+    assert_eq!(record_count(&root), 3);
+}
+
+/// Deleting a book on a computer and uploading it again is an ordinary
+/// thing to do, and it used to leave the ledger with two ids for one file:
+/// the record of the copy that was deleted still named the place, and the
+/// install, finding nothing there to replace, adopted the new copy under a
+/// fresh id at the same place. Both were live, so the scan's join picked
+/// between them by ledger order, and the id the install had published lost
+/// to the one it had never heard of. Publishing a record now takes the
+/// place with it.
+#[test]
+fn a_book_deleted_and_uploaded_again_is_one_copy_under_the_id_the_install_gave_it() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let bytes = body(1, 3_000);
+    let size = bytes.len() as u32;
+    sideload(&books, BOOK, &bytes);
+    let (_, ids) = scan(&root, &[(BookRoot::Library, BOOK, size)]).unwrap();
+    let adopted = ids[0].unwrap();
+
+    // The book goes away on a computer, and the next scan ages its record.
+    remove_from_shelf(&root, BOOK);
+    let (assigned, _) = scan(&root, &[]).unwrap();
+    assert_eq!(assigned.missing, 1);
+
+    // The reader uploads the same book again, to the same name.
+    let mut later = words();
+    for _ in 0..4 {
+        later();
+    }
+    upload_minting(&root, &books, BOOK, &bytes, &mut later)
+        .unwrap()
+        .expect("lands");
+    let (installed, installed_size, source) = record_for(&root, BOOK).expect("adopted");
+    assert_ne!(installed, adopted, "nothing established continuity");
+    assert_eq!(installed_size, size);
+    assert!(digest_agrees(source, &bytes));
+    assert_eq!(
+        record_count(&root),
+        1,
+        "the deleted copy's claim on the place went with it"
+    );
+    let live = ledger::open(&root).unwrap().unwrap();
+    assert_eq!(
+        ledger::find_by_id(&root, &live, adopted).unwrap(),
+        None,
+        "and its id names nothing rather than the new copy's file"
+    );
+
+    // So the scan reads the file as the copy the install said it was.
+    let (assigned, ids) = scan(&root, &[(BookRoot::Library, BOOK, size)]).unwrap();
+    assert_eq!(
+        assigned,
+        Assignment {
+            matched: 1,
+            ..Assignment::default()
+        }
+    );
+    assert_eq!(ids, vec![Some(installed)]);
+}
+
+/// A book replaced on a computer by one of another size is a new copy at an
+/// old name: the row no longer matches the record that named it, so the row
+/// is minted an id of its own and the old record is carried as missing, at
+/// a name the new copy now holds. What the old id must not do is answer
+/// with that name. Nothing established that the two copies are the same
+/// book, and resolving the old id's state against the new copy's file is
+/// the merge the whole model exists to prevent.
+#[test]
+fn a_copy_replaced_on_a_computer_leaves_the_old_id_with_no_place_to_give() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let old = body(1, 3_000);
+    sideload(&books, BOOK, &old);
+    // One word source across both scans, so the two mints are two ids.
+    let mut random = words();
+    let (_, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, BOOK, old.len() as u32)],
+        &mut random,
+    )
+    .unwrap();
+    let first = ids[0].unwrap();
+
+    // The card goes into a computer, which puts another book at that name.
+    let other = body(2, 4_100);
+    overwrite_shelf(&root, BOOK, &other);
+    let (assigned, ids) = scan_minting(
+        &root,
+        &[(BookRoot::Library, BOOK, other.len() as u32)],
+        &mut random,
+    )
+    .unwrap();
+    assert_eq!(
+        assigned.minted, 1,
+        "an unexplained replacement is a new copy"
+    );
+    assert_eq!(assigned.missing, 1, "and the old record is carried a while");
+    let second = ids[0].unwrap();
+    assert_ne!(second, first);
+
+    let live = ledger::open(&root).unwrap().unwrap();
+    let new_copy = ledger::find_by_id(&root, &live, second).unwrap().unwrap();
+    assert_eq!(new_copy.locator(), Some(BOOK), "the copy that is there");
+    assert_eq!(new_copy.misses, 0);
+    assert_eq!(new_copy.byte_size, other.len() as u32);
+
+    let old_copy = ledger::find_by_id(&root, &live, first).unwrap().unwrap();
+    assert_eq!(
+        old_copy.place, None,
+        "the name it knew is another copy's now"
+    );
+    assert_eq!(old_copy.misses, 1);
+    assert_eq!(
+        old_copy.byte_size,
+        old.len() as u32,
+        "and the record is still there to be matched by its bytes"
+    );
+
+    // The same holds however far the old record is from the new one in
+    // ledger order, which is what decides nothing here.
+    let third = body(3, 2_048);
+    upload_minting(&root, &books, "Other.epub", &third, &mut random)
+        .unwrap()
+        .expect("lands");
+    let live = ledger::open(&root).unwrap().unwrap();
+    assert_eq!(
+        ledger::find_by_id(&root, &live, first)
+            .unwrap()
+            .unwrap()
+            .place,
+        None
+    );
 }
