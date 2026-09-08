@@ -766,9 +766,9 @@ ledger by place: a row a live record names by root, locator and size keeps
 that record's id, every other row is minted one, and the new records are
 committed as a ledger generation before the catalog header lands, so no
 committed row carries an id the ledger could lose. Two byte-identical files
-are two ids with independent state. A copy moved on a computer is a new id
-to this milestone, and the record of the copy that left stays as a missing
-book for the reconciliation that will match it by digest. Each record counts
+are two ids with independent state. A copy moved on a computer is matched
+back to its record by the search described below, and the record of a copy
+that has simply gone stays as a missing book meanwhile. Each record counts
 the consecutive scans its place has been missing; a missing record is carried
 for eight such scans and then left out, and missing records are the first to
 go when a generation would not fit beside the live library, so the ledger
@@ -836,6 +836,95 @@ against another copy's book is the merge that costs more than the copy.
 Both records stay in the ledger, to be matched by their bytes or aged out
 with everything else the card stopped holding. Two records that are both
 missing keep their places, neither being the one a scan chose.
+
+A copy moved or renamed on a computer is found again rather than adopted as
+a stranger, when the card says enough to prove it. The scan already knows
+which records named no row and which rows no record named, so the search
+runs between those two sets alone: a shelf that did not change reads no
+book, and a stable file is not read again to prove what the join matched by
+place. Size narrows the candidates and the recorded digest decides, since a
+name and a length are not a book.
+
+Most of a library has no digest in the ledger, since a scan adopts a book
+without reading it and reading a whole card to adopt it would cost hours for
+a move that may never happen. So the open book's bytes are read instead, once
+per copy, and recorded in the claim on the cache directory it keeps its
+reading place in. The read rides the same background slices the spine walk
+uses rather than standing between the reader and their first page: a book is
+megabytes and this card gives up around 550 kB a second, so a large one is
+the better part of a minute. It follows the book that is open, by root,
+locator and length rather than by row number or cache key: a rescan
+renumbers rows, and a cache key is 28 bits of a hash that two books can
+share, either of which would leave a book unread on another book's account.
+A reader who moves on takes the reading with them, and the copy they left is
+read again whenever it is opened again. Nothing depends on it finishing, and
+a partial read records nothing.
+
+That directory is named for the place the record still names, so the search
+asks it for any copy the ledger says nothing about: a book that has been
+read can be found again, and one that has not cannot, which is the same rule
+the reading place it would carry lives by. A claim naming another book is no
+evidence about this one, since a cache key is 28 bits of a hash and two
+books can land on one and the same directory.
+
+What a claim says is copied into the copy's own record on the scan that
+first misses it, whether or not anything turned up to compare it with. The
+cache is a cache: a departed book's directory is what the sweep tidies away,
+and the ledger is where identity lives, so once the library has learned what
+a copy is, an ordinary tidy-up cannot make it forget. Without that, two
+identical copies could lose one of their two claims and leave the other
+looking like the only book those bytes could belong to.
+
+So what a copy *is*, for a book the library adopted without reading, is the
+bytes seen at its own place while that place looked unchanged. A computer
+can put a different book of exactly the same length at that name, which the
+join's cheap filter cannot see and no later reading can undo, since nothing
+on the card ever said what the first book's bytes were. The copy then takes
+the bytes that were read there, and a move carries its id and its reading
+place to wherever those bytes go. That is a deliberate rule rather than an
+oversight: the alternative is reading every book as the scan adopts it,
+which is hours on a full card for a move that may never happen, and the
+cost is bounded by what the caches already do, since a same-sized
+replacement at a stable name reopens the old book's cache and resumes its
+place today. The rule makes that durable across a later rename rather than
+inventing it. A copy that arrived as an upload is not in this position: its
+bytes were read as it landed.
+
+A copy nothing recorded the bytes of is left missing while the file that
+appeared is adopted in its own right. Ambiguity is left alone from either
+side: two missing copies of the same bytes, or one missing copy and two
+files holding them, are copies no file can be told apart by, so their places
+stay as they are. A scan decides a length or leaves it alone. Every
+unclaimed file whose length a missing copy has is read, so one match
+means one match. There is no reading budget to run out of and
+nothing carried to another scan. Bounding that reading instead would mean
+deciding on part of the evidence, or keeping a half-finished question
+somewhere, and a question that outlives a scan wants a journal of its own
+rather than a state spread through the catalog, the ledger and the cache.
+What a card costs a scan is therefore the reading of every file whose length
+changed hands, which is the size of the reorganisation rather than the size
+of the library. A file the card would not give up costs its whole length:
+what the files of that length hold is not known well enough to say which
+copy any of them is, so those copies are left alone and the files adopted
+in their own right.
+
+One scan repairs as many copies as the scan arena holds, which bounds the
+memory rather than the evidence: every missing copy's digest is compared
+against the ones being carried, so a twin past the end of the table still
+refuses the repair.
+
+A repaired locator on its own would leave the reader's place behind, since
+a position is filed under the place a book was read from. So the scan
+reports each copy it finds again, before it writes the ledger, and the
+firmware carries the position from the old directory to the new one,
+reading the destination once more to say what it is vouching for. Reporting
+before the write costs a reset nothing: the record is still missing and the
+row still unadopted, so the next scan finds the same move and carries the
+same place again. A card that refuses the carry itself is the one case this
+bridge does not cover: the copy keeps its id and loses its place, rather
+than the scan failing over a cache write. The bridge goes when positions
+hang from the id, at which point a repaired locator keeps the place with
+nothing to copy.
 
 Positions and caches still key by place, and the mapping they will move onto
 is what exists now: a place resolves to the id that owns it

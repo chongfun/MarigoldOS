@@ -106,9 +106,12 @@ pub struct CatalogRecord {
     pub upload_alias: String<{ crate::storage::MAX_ALIAS_UTF8_BYTES }>,
     pub byte_size: u32,
     pub source_hash: u32,
-    /// Which library copy this row is, cached from the ledger. `None` only
-    /// in a row the scan has staged and the identity join has not reached,
-    /// which a committed catalog does not contain.
+    /// Which library copy this row is, cached from the ledger.
+    ///
+    /// `None` only in a row the scan has staged and the identity join has
+    /// not reached, which a committed catalog does not contain: the join
+    /// decides every row it commits, giving it a copy's id or one of its
+    /// own.
     pub book_id: Option<BookId>,
 }
 
