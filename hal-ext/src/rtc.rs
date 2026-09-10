@@ -23,6 +23,20 @@ pub fn woke_from_deep_sleep_gpio() -> bool {
     matches!(esp_hal::rtc_cntl::wakeup_cause(), SleepSource::Gpio)
 }
 
+/// Whether this boot is the RTC timer wake a bench scenario armed.
+///
+/// The shipped rule stays GPIO-only on purpose, so nothing but a real button
+/// vouches for the panel contents. A bench build arms the timer as well, and
+/// its wake is just as good a witness that the sleep frame is still on the
+/// panel: the chip powered down through the same handshake either way. Left
+/// out, a timer wake reads as a cold boot, the display pays the full
+/// waveform instead of the fast one, and the suite measures a path the
+/// shipped firmware does not take.
+#[cfg(feature = "bench-selftest")]
+pub fn woke_from_deep_sleep_timer() -> bool {
+    matches!(esp_hal::rtc_cntl::wakeup_cause(), SleepSource::Timer)
+}
+
 /// Enters deep sleep with `wake_pin` (the active-low Power button) as the wake
 /// source. The chip draws ~10–15 µA until the button is pressed, then resets
 /// and reboots from `main`. Returns `!` because waking is a fresh boot, not a
@@ -40,6 +54,31 @@ pub fn enter_deep_sleep_button(rtc: &mut Rtc<'_>, wake_pin: &mut dyn RtcPinWithR
         [(wake_pin, WakeupLevel::Low)];
     let wakeup = RtcioWakeupSource::new(&mut wake_pins);
     rtc.sleep_deep(&[&wakeup])
+}
+
+/// Deep sleep that wakes on the button **or** an RTC timer, for the bench
+/// scenarios that have to sleep and come back with nobody present.
+///
+/// A sleeping device cannot be told to wake: the radio is down, the USB
+/// device is gone, and the only host-side control left is a reset, which is
+/// a reboot rather than a wake and so proves nothing about the wake path.
+/// Arming the timer beside the button lets `sleep-sync` and `reader-soak`
+/// run themselves.
+///
+/// Deliberately not on the shipped path, and behind `bench-selftest`
+/// rather than an option: a reader that wakes itself on a timer would spend
+/// the battery this firmware is careful with.
+#[cfg(feature = "bench-selftest")]
+pub fn enter_deep_sleep_button_or_timer(
+    rtc: &mut Rtc<'_>,
+    wake_pin: &mut dyn RtcPinWithResistors,
+    after: Duration,
+) -> ! {
+    let mut wake_pins: [(&mut dyn RtcPinWithResistors, WakeupLevel); 1] =
+        [(wake_pin, WakeupLevel::Low)];
+    let rtcio = RtcioWakeupSource::new(&mut wake_pins);
+    let timer = TimerWakeupSource::new(after);
+    rtc.sleep_deep(&[&rtcio, &timer])
 }
 
 /// Light sleep with a short RTC timer wake. Keeps DRAM context, used during

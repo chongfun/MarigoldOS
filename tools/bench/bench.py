@@ -52,6 +52,51 @@ STORAGE_OPEN_RE = re.compile(
     r"storage: open complete status=(?P<status>\w+) pages=(?P<pages>\d+) "
     r"chapters=(?P<chapters>\d+)"
 )
+# The last line a bench-selftest scenario prints. Only a firmware built with
+# that feature can emit it, so recognizing it changes nothing about any
+# capture taken before or since from a shipped build. It exists because the
+# firmware and the host count different things: folder-nav stops on completed
+# round trips, and a selftest that picks twenty rows on a card whose rows
+# are books produces none of them, so a count-only capture would wait for a
+# target the device stopped being able to reach the moment its loop ended.
+SELFTEST_DONE_RE = re.compile(
+    r"bench-selftest: scenario=(?P<scenario>[a-z-]+) result=(?P<result>\S+)"
+)
+# A scenario reporting that it could not perform part of the workflow it
+# advertises. Separate from the terminal `result=` record on purpose: the run
+# continues, because the rest of a soak's sleep and wake is still evidence,
+# and only the terminal record stops a capture. `--strict` fails on this, so a
+# soak cannot skip its chapter navigation and still certify, which it could
+# before: every other signal that suite checks for is produced by a jumpless
+# pass.
+SELFTEST_INVALID_RE = re.compile(
+    r"bench-selftest: scenario=(?P<scenario>[a-z-]+) invalid=(?P<reason>\S+)"
+)
+# Which scenario the flashed image is actually about to run, printed once per
+# boot before it touches anything. Worth checking against the workflow the
+# operator asked for, because a stale image certifies the wrong suite in
+# silence: a sleep-sync build captured as `reader-soak --strict` produces
+# inputs, renders, completed sleeps and later wakes, which is the whole of
+# what reader-soak's gate asks for, and a successful sleeping scenario writes
+# no terminal record for the result check to catch.
+# A scenario saying how many of its operations are fully decided, written
+# after the last postcondition of the nth one has been checked. The count
+# stop for a selftest capture keys on this rather than on the operation's own
+# telemetry, because a paired render or a `folder_leave` precedes the
+# firmware's verdict: a turn still has its quiet check ahead, a leave its
+# depth wait and quiet check, and a host that stopped on the telemetry left
+# the failing verdict unsent and the capture certified.
+SELFTEST_COMPLETED_RE = re.compile(
+    r"bench-selftest: scenario=(?P<scenario>[a-z-]+) completed=(?P<kind>[a-z_]+) count=(?P<count>\d+)"
+)
+
+# Stop-target events that a selftest certifies with a typed checkpoint. A
+# target outside this set, sleep_complete today, keeps its telemetry
+# predicate: the sleep is the operation, the reboot is its verdict, and no
+# checkpoint could be written after it.
+CHECKPOINTED_STOP_EVENTS = {"page_turn", "folder_leave"}
+SELFTEST_START_RE = re.compile(r"bench-selftest: scenario=(?P<scenario>[a-z-]+) view=(?P<view>\S+)")
+
 # Printed once per boot, before esp_rtos::start, so it carries no t_ms; it
 # marks the start of a boot's time base and says how the chip woke.
 DEEP_SLEEP_WAKE_RE = re.compile(
@@ -116,7 +161,11 @@ SUITES = {
         # Entries, not renders: what this suite exists to time is the walk a
         # folder costs to enter, and a Library repaint that answered no press
         # is not one of those.
-        stop_event="folder_enter",
+        # The completed round trip, not the entry. "Enter and leave folders"
+        # is the workload, and stopping on the entry ended a capture with its
+        # last leave still in flight, so the operation with its own storage
+        # telemetry went unmeasured on the sample the operator asked for.
+        stop_event="folder_leave",
         stop_count_arg="entries",
         stop_count_default=20,
     ),
@@ -281,6 +330,28 @@ def process_capture_stream(
     pending_prestage = False
     pending_prestage_deadline: float | None = None
     pending_prestage_lines = 0
+    # The last folder leave, waiting for the repaint that completes it. Its
+    # own state and not the prestage one: the prestage wait deliberately
+    # gives up on a line ceiling or a deadline and still calls the run
+    # complete, which for a leave would certify the missing repaint the wait
+    # exists to require.
+    pending_leave_render = False
+    pending_leave_deadline: float | None = None
+    pending_leave_t_ms: int | None = None
+    # A self-driven capture stops a checkpointed target only on the
+    # firmware's typed `completed=` checkpoint. The banner is one line at
+    # boot and a finite scenario works for minutes after it, so a capture
+    # attached late sees no banner; every selftest record and every injected
+    # press, which alone carries `action=`, marks the stream as self-driven,
+    # and a press precedes the operation it drives, so the mark lands before
+    # the operation's telemetry can reach the count. Checkpoints count from
+    # where the capture joined, so a late attach owes N operations from there
+    # rather than stopping on a total it did not watch accumulate. The first
+    # checkpoint a late attach sees certifies an operation the capture may
+    # have joined midway, so it is the baseline and not a sample; only a
+    # capture that saw the announce has watched its first operation whole.
+    selftest_seen = False
+    checkpoints = CheckpointTally()
 
     for line in lines:
         if line != "":
@@ -297,10 +368,49 @@ def process_capture_stream(
                     counts[counter] = counts.get(counter, 0) + 1
                 turns.observe(event)
                 counts["page_turn"] = turns.turns
+                kind_name = str(event.get("event", ""))
+                injected_press = kind_name == "input" and isinstance(event.get("action"), str)
+                if not selftest_seen and (kind_name.startswith("selftest_") or injected_press):
+                    selftest_seen = True
+                    counts["selftest_seen"] = 1
+                checkpoints.observe(event)
+                if kind_name == "selftest_completed":
+                    kind = str(event.get("kind", ""))
+                    counts[f"selftest_completed:{kind}"] = checkpoints.completed(kind)
         else:
             parsed_events = []
 
-        if pending_prestage:
+        if pending_leave_render:
+            # Only a render frozen after the leave completes it. The Back press
+            # itself renders at once, showing the folder as Leaving with the
+            # depth unchanged, and the SD leave prints its line in about 40 ms,
+            # well inside that render's 400 ms flush. So the first render to
+            # settle after `folder_leave` is usually the Back render, requested
+            # before the leave, and accepting it ended the capture with the
+            # parent listing still undrawn. `req_ms` is the freeze boundary
+            # the harness already pairs presses on; the same boundary answers
+            # here.
+            if any(
+                e.get("event") == "render"
+                and isinstance(e.get("req_ms"), int)
+                and pending_leave_t_ms is not None
+                and e["req_ms"] > pending_leave_t_ms
+                for e in parsed_events
+            ):
+                # Cleared before the break, or the post-loop check below reads
+                # a satisfied wait as an unmet one.
+                pending_leave_render = False
+                break
+            if pending_leave_deadline is not None and time.monotonic() >= pending_leave_deadline:
+                # It did not. The SD work finished and nothing drew it, which
+                # is a fault rather than a sample, so the run is marked and
+                # `observed_stop_reason` refuses to call it complete. Marked
+                # here and cleared, so the post-loop check counts a stream
+                # that simply ended rather than adding a second mark.
+                counts["folder_leave_unrendered"] = counts.get("folder_leave_unrendered", 0) + 1
+                pending_leave_render = False
+                break
+        elif pending_prestage:
             has_prestage = any(e.get("event") == "prestage" for e in parsed_events)
             has_new_turn_or_render = any(
                 e.get("event") in {"render", "input"} for e in parsed_events
@@ -318,8 +428,52 @@ def process_capture_stream(
                 or expired
             ):
                 break
+        elif any(e.get("event") == "selftest_done" for e in parsed_events):
+            # The device drives itself and has finished. Nothing further is
+            # coming, so waiting out a duration or a count target only delays
+            # the report.
+            break
+        elif (
+            selftest_seen
+            and stop_target
+            and stop_target[0] in CHECKPOINTED_STOP_EVENTS
+            and counts.get(f"selftest_completed:{stop_target[0]}", 0) >= stop_target[1]
+        ):
+            # The firmware has checked every postcondition of the nth
+            # operation of this kind, so its verdict, an `invalid=` or a
+            # terminal, is already in the log if there was one.
+            break
+        elif selftest_seen and stop_target and stop_target[0] in CHECKPOINTED_STOP_EVENTS:
+            # Telemetry may already show the requested count, but a
+            # self-driven capture stops a checkpointed target only on its
+            # checkpoint. Keep reading. A target of another kind, the sleep
+            # cycle, falls through to its telemetry predicate below.
+            pass
         elif stop_target and counts.get(stop_target[0], 0) >= stop_target[1]:
-            if stop_target[0] == "page_turn":
+            if stop_target[0] == "folder_leave" and not any(
+                e.get("event") == "render" for e in parsed_events
+            ):
+                # `folder_leave` is printed by the storage call as soon as the
+                # SD work is done, before its listing has reached the app,
+                # been folded into state, or been drawn. Breaking there ends
+                # the capture mid-round-trip on the very sample the operator
+                # asked for, and hides a listing that arrived and then failed
+                # to render. So the target leave waits for the repaint that
+                # completes it, and only a repaint satisfies that wait.
+                pending_leave_render = True
+                pending_leave_t_ms = max(
+                    (
+                        e["t_ms"]
+                        for e in parsed_events
+                        if e.get("event") == "folder_leave" and isinstance(e.get("t_ms"), int)
+                    ),
+                    default=None,
+                )
+                deadline = time.monotonic() + pending_prestage_timeout_s
+                pending_leave_deadline = deadline
+                if on_deadline_set is not None:
+                    on_deadline_set(deadline)
+            elif stop_target[0] == "page_turn":
                 already_prestaged = any(
                     e.get("event") == "render" and isinstance(e.get("prestage_ms"), int)
                     for e in parsed_events
@@ -335,6 +489,14 @@ def process_capture_stream(
                     break
             else:
                 break
+
+    if pending_leave_render:
+        # The stream ended while the last leave still owed its repaint. Same
+        # verdict as the deadline expiring: the count target is met on paper
+        # and the round trip is not finished, so the run must not read as
+        # complete. A port pulled mid-flush lands here too, which is the
+        # honest answer for it.
+        counts["folder_leave_unrendered"] = counts.get("folder_leave_unrendered", 0) + 1
 
     return counts
 
@@ -470,13 +632,15 @@ def run_capture(args: argparse.Namespace) -> int:
 # Stop conditions that mean the capture collected what it was told to. The
 # rest — an interrupted capture that had one, a stream that simply ended —
 # leave a partial run `--strict` must not certify.
-COMPLETED_STOP_REASONS = {"count", "duration", "operator"}
+COMPLETED_STOP_REASONS = {"count", "duration", "operator", "selftest"}
 
 # Stop events and the request key that names what the operator asked for.
 STOP_EVENT_REQUEST_KEYS = {
     "page_turn": "page_turns",
     "sleep_complete": "sleep_cycles",
-    "folder_enter": "folder_entries",
+    # Still `--entries`, since that is what an operator asks for; what it
+    # counts is completed enter-and-leave round trips.
+    "folder_leave": "folder_entries",
 }
 
 
@@ -518,7 +682,28 @@ def observed_stop_reason(
     stop_at: float | None,
 ) -> str:
     """Why the capture stream ended, from what it actually reached."""
-    if stop_target is not None and counts.get(stop_target[0], 0) >= stop_target[1]:
+    if counts.get("folder_leave_unrendered", 0) > 0:
+        # The requested leaves all happened and the last one was not drawn.
+        # The count target is met on paper, so without this the run reads as
+        # `count` and certifies the round trip it could not finish.
+        return "leave-unrendered"
+    if counts.get("selftest_done", 0) > 0:
+        # A self-driving scenario ran to its own end. That is a stop
+        # condition someone asked for, even when the suite's own count
+        # target went unmet: on a flat card folder-nav produces no
+        # `folder_leave` at all, and the run is complete regardless.
+        return "selftest"
+    if (
+        stop_target is not None
+        and counts.get("selftest_seen", 0) > 0
+        and stop_target[0] in CHECKPOINTED_STOP_EVENTS
+    ):
+        # A self-driven capture's count for a checkpointed target is the
+        # typed checkpoint, not the telemetry, which precedes the verdict on
+        # the last operation.
+        if counts.get(f"selftest_completed:{stop_target[0]}", 0) >= stop_target[1]:
+            return "count"
+    elif stop_target is not None and counts.get(stop_target[0], 0) >= stop_target[1]:
         return "count"
     if stop_at is not None and time.monotonic() >= stop_at:
         return "duration"
@@ -556,6 +741,21 @@ def reset_device(espflash: str, port: str) -> None:
     subprocess.run(command, check=True)
 
 
+def press_action(event: dict[str, Any]) -> Any:
+    """What a press meant: its logical action when the line carries one, else
+    the physical key.
+
+    An injected press logs both. `button=` is the physical key the reducer
+    saw, which a swapped front pair or a flipped orientation maps to another
+    action, and `action=` is what the scenario asked for. Pairing on the key
+    alone made fifty genuine page turns invisible under PagesLeft, where the
+    key that turns a page is Confirm. A manual capture has no `action=` and
+    is read as it always was.
+    """
+    action = event.get("action")
+    return action if isinstance(action, str) else event.get("button")
+
+
 def event_counters(event: dict[str, Any]) -> list[str]:
     event_name = str(event.get("event", ""))
     counters = [event_name]
@@ -563,7 +763,7 @@ def event_counters(event: dict[str, Any]) -> list[str]:
         counters.append("reading_render")
     if is_completed_sleep_cycle(event):
         counters.append("sleep_complete")
-    if event_name == "input" and event.get("button") in {"Next", "Previous"}:
+    if event_name == "input" and press_action(event) in {"Next", "Previous"}:
         counters.append("page_input")
     return counters
 
@@ -715,6 +915,51 @@ def parse_line(line: str, suite: str = "unknown") -> list[dict[str, Any]]:
                 "prestage_ms": int(data["prestage"]),
                 "t_ms": int(data["t"]),
                 "legacy": True,
+            }
+        ]
+
+    match = SELFTEST_COMPLETED_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "selftest_completed",
+                "scenario": match.group("scenario"),
+                "kind": match.group("kind"),
+                "count": int(match.group("count")),
+            }
+        ]
+
+    match = SELFTEST_START_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "selftest_start",
+                "scenario": match.group("scenario"),
+                "view": match.group("view"),
+            }
+        ]
+
+    match = SELFTEST_INVALID_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "selftest_invalid",
+                "scenario": match.group("scenario"),
+                "reason": match.group("reason"),
+            }
+        ]
+
+    match = SELFTEST_DONE_RE.match(text)
+    if match:
+        return [
+            {
+                "suite": suite,
+                "event": "selftest_done",
+                "scenario": match.group("scenario"),
+                "result": match.group("result"),
             }
         ]
 
@@ -1517,7 +1762,7 @@ def page_turn_stats(events: list[dict[str, Any]]) -> PageTurnStats:
     coalesced_presses = 0
     for event in sorted(events, key=event_sort_key):
         name = event.get("event")
-        if name == "input" and event.get("button") in {"Next", "Previous"}:
+        if name == "input" and press_action(event) in {"Next", "Previous"}:
             t_ms = event.get("t_ms")
             if isinstance(t_ms, int):
                 presses += 1
@@ -1601,7 +1846,7 @@ class PageTurnCounter:
             if self.last_t is not None and self.last_t - t_ms > _BOOT_REGRESSION_SKEW_MS:
                 self._new_epoch()
             self.last_t = t_ms
-        if name == "input" and event.get("button") in {"Next", "Previous"}:
+        if name == "input" and press_action(event) in {"Next", "Previous"}:
             if isinstance(t_ms, int):
                 self.pending.append(t_ms)
         elif name == "render" and isinstance(t_ms, int):
@@ -2035,6 +2280,10 @@ BUDGET_SCHEMA: dict[str, set[str]] = {
         "warm_book_open_warn_ms",
         "catalog_load_warn_ms",
     },
+    "folder-nav": {
+        "folder_enter_warn_ms",
+        "folder_leave_warn_ms",
+    },
 }
 
 # Budget keys that bound the same measurement from both sides, as
@@ -2302,7 +2551,80 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             per_run_catalog,
             "catalog load events",
         )
+    folder_nav = budgets.get("folder-nav", {})
+    if folder_nav and "folder-nav" in in_play:
+        runs = section_runs(events, "folder-nav")
+        # Successful operations only. A refused leave returns in a fraction
+        # of the time a real one takes and is a card fault, which the suite
+        # check names on its own; pooling it here would pull the percentile
+        # toward how fast the card said no.
+        per_run_enter, enter = per_run_samples(
+            runs,
+            lambda run_events: values(folder_samples(run_events, "folder_enter"), "ms"),
+        )
+        warn_if_above(
+            warnings,
+            "folder enter p95",
+            percentile(enter, 95) if enter else None,
+            folder_nav.get("folder_enter_warn_ms"),
+        )
+        warn_if_unobserved(
+            warnings,
+            "folder-nav",
+            folder_nav,
+            "folder_enter_warn_ms",
+            runs,
+            per_run_enter,
+            "folder_enter events",
+        )
+        per_run_leave, leave = per_run_samples(
+            runs,
+            lambda run_events: values(folder_samples(run_events, "folder_leave"), "ms"),
+        )
+        warn_if_above(
+            warnings,
+            "folder leave p95",
+            percentile(leave, 95) if leave else None,
+            folder_nav.get("folder_leave_warn_ms"),
+        )
+        warn_if_unobserved(
+            warnings,
+            "folder-nav",
+            folder_nav,
+            "folder_leave_warn_ms",
+            runs,
+            per_run_leave,
+            "folder_leave events",
+        )
     return warnings
+
+
+def folder_samples(events: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    """Folder operations of one kind that succeeded, so a budget times the
+    operation and not the card refusing it."""
+    return [e for e in events if e.get("event") == kind and e.get("ok") is not False]
+
+
+def measured_folder_round_trips(events: list[dict[str, Any]]) -> int:
+    """Round trips with both halves in the capture: a successful enter and
+    the successful leave that follows it before any other enter.
+
+    Entering and leaving are separate measured operations with separate
+    budgets, so a round trip whose enter line is missing has a leave sample
+    and no enter sample, and counting leaves alone would report it measured.
+    Pairing in order also refuses a duplicated or misordered record.
+    """
+    pairs = 0
+    open_enter = False
+    for event in events:
+        kind = event.get("event")
+        if kind == "folder_enter":
+            open_enter = event.get("ok") is not False
+        elif kind == "folder_leave":
+            if open_enter and event.get("ok") is not False:
+                pairs += 1
+            open_enter = False
+    return pairs
 
 
 def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
@@ -2334,6 +2656,66 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
         event_names = {str(event.get("event")) for event in signal_events}
         if "warning" in event_names:
             warnings.append(f"{label}: warning events present")
+        invalid_reasons = sorted(
+            {
+                str(event.get("reason", "unspecified"))
+                for event in signal_events
+                if event.get("event") == "selftest_invalid"
+            }
+        )
+        for reason in invalid_reasons:
+            warnings.append(
+                f"{label}: the selftest scenario reported it could not run "
+                f"{reason}, so this capture does not cover the whole workflow"
+            )
+        # A self-driving scenario writes exactly one terminal record, and only
+        # `done` means it finished what it set out to do. Stopping the capture
+        # on any of them is right, since the device has stopped talking, but
+        # certifying any of them was not: a storage-cache run that failed to
+        # open on its second cycle ended the capture on `nav-failed` while its
+        # first cycle had already produced the telemetry and budget samples
+        # this gate asks for.
+        # Every selftest record names its scenario, so every one of them can
+        # answer whether the firmware on the device is what the command asked
+        # for. Checked across all three and not only the announcement: that
+        # line prints once, four seconds after boot, while a finite scenario
+        # goes on working for minutes, so a capture attached late sees a
+        # terminal record and no announcement. A page-turn image captured as
+        # `storage-cache --strict` supplies storage telemetry from opening
+        # its book and then reports `scenario=page-turn result=done`, which
+        # the result check has no opinion about.
+        #
+        # Only checked where a record exists, so a capture from a shipped
+        # build is unaffected: it emits none of these. `workflow` and not
+        # `suite`, so a thermal-run comparison uses the workflow it selected.
+        announced = {
+            str(event.get("scenario"))
+            for event in signal_events
+            if str(event.get("event", "")).startswith("selftest_")
+        }
+        for scenario in sorted(announced):
+            if workflow is not None and scenario != workflow:
+                warnings.append(
+                    f"{label}: the device is running the {scenario} selftest "
+                    f"scenario, but this capture was taken as {workflow}"
+                )
+        terminals = [e for e in signal_events if e.get("event") == "selftest_done"]
+        for event in terminals:
+            result = str(event.get("result", "unspecified"))
+            if result != "done":
+                warnings.append(
+                    f"{label}: the selftest scenario ended on result={result} "
+                    "rather than done, so it did not finish the workflow"
+                )
+        if len(terminals) > 1:
+            # One scenario, one ending. Two means the firmware printed a
+            # terminal record and carried on, which is how the earlier
+            # storage-cache arm produced `nav-failed` and then `done`.
+            reported = ", ".join(str(e.get("result")) for e in terminals)
+            warnings.append(
+                f"{label}: {len(terminals)} selftest terminal records ({reported}); "
+                "a scenario owes exactly one"
+            )
         if run.suite == "thermal-run" and "refresh" not in event_names:
             # Ambient investigations live on refresh timing whatever workflow
             # they ran under.
@@ -2388,10 +2770,28 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
                     f"known results are {', '.join(sorted(CATALOG_LOAD_RESULTS))}"
                 )
         elif workflow == "folder-nav":
-            # Entering a folder is the walk this suite times. A capture with
-            # none of them measured nothing it was run for.
+            # Entering and leaving are both the walk this suite times, and
+            # they are separate storage operations with separate telemetry. A
+            # capture holding only entries measured half of what it was run
+            # for, which is what a scenario that descended instead of coming
+            # back out produced.
             if "folder_enter" not in event_names:
                 warnings.append(f"{label}: no folder entry telemetry captured")
+            elif "folder_leave" not in event_names:
+                warnings.append(
+                    f"{label}: folder entries captured but no leaves; the walk "
+                    "went down and did not come back"
+                )
+            failed = sum(
+                1
+                for event in signal_events
+                if event.get("event") == "folder_leave" and event.get("ok") is False
+            )
+            if failed:
+                warnings.append(
+                    f"{label}: {failed} folder leave(s) failed; a refused leave "
+                    "is a card fault, not a sample"
+                )
         elif workflow == "sleep-sync":
             if not any(is_terminal_sleep(event) for event in signal_events):
                 warnings.append(
@@ -2517,6 +2917,91 @@ def requested_counts(start: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def is_self_driven(events: list[dict[str, Any]]) -> bool:
+    """Whether a selftest scenario, not a hand, drove this capture.
+
+    Every selftest record says so, and so does an injected press, which
+    alone carries `action=`. A capture attached late sees no announcement
+    but sees the press before the operation it drives.
+    """
+    return any(
+        str(event.get("event", "")).startswith("selftest_")
+        or (event.get("event") == "input" and isinstance(event.get("action"), str))
+        for event in events
+    )
+
+
+class CheckpointTally:
+    """Typed `completed=` checkpoints, counted from where the capture joined.
+
+    The capture loop feeds this one event at a time to decide when to stop,
+    and the report feeds it the whole run to decide what was collected, so
+    both answer from the same population. The first checkpoint of a kind is
+    a sample only if the capture saw the announcement: without it, the
+    operation that checkpoint certifies may have begun before the port was
+    open, and it is the baseline instead.
+    """
+
+    def __init__(self) -> None:
+        self.announce_seen = False
+        self._base: dict[str, int] = {}
+        self._completed: dict[str, int] = {}
+        # How many events preceded the baseline checkpoint, per kind: the
+        # telemetry of the operations that count starts after it.
+        self._window_start: dict[str, int] = {}
+        self._seen = 0
+
+    def observe(self, event: dict[str, Any]) -> None:
+        self._seen += 1
+        kind_name = str(event.get("event", ""))
+        if kind_name == "selftest_start":
+            self.announce_seen = True
+        elif kind_name == "selftest_completed":
+            kind = str(event.get("kind", ""))
+            n = int(event.get("count", 0))
+            if kind not in self._base:
+                if self.announce_seen:
+                    self._base[kind] = n - 1
+                    self._window_start[kind] = 0
+                else:
+                    self._base[kind] = n
+                    self._window_start[kind] = self._seen
+            self._completed[kind] = n - self._base[kind]
+
+    def completed(self, kind: str) -> int:
+        return self._completed.get(kind, 0)
+
+    def window_start(self, kind: str) -> int:
+        return self._window_start.get(kind, 0)
+
+
+def checkpoint_completions(events: list[dict[str, Any]], kind: str) -> int:
+    tally = CheckpointTally()
+    for event in events:
+        tally.observe(event)
+    return tally.completed(kind)
+
+
+def counted_window(events: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    """The events from the first counted operation of `kind` onward.
+
+    A late attach's first checkpoint is a baseline, and the telemetry of the
+    operation it certifies must not be measured against the request either:
+    that operation's `folder_leave` is in the stream while its enter is not.
+    The run's own `run_start` and `run_end` are kept so the window still
+    reads as a run.
+    """
+    tally = CheckpointTally()
+    for event in events:
+        tally.observe(event)
+    start = tally.window_start(kind)
+    return [
+        event
+        for index, event in enumerate(events)
+        if index >= start or event.get("event") in ("run_start", "run_end")
+    ]
+
+
 def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[str]:
     """Each thing the capture was asked for, against what it came home with."""
     requested = requested_counts(start)
@@ -2526,9 +3011,24 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
     end = next((event for event in run.events if event.get("event") == "run_end"), None)
 
     seconds = requested.get("seconds")
+    # A selftest scenario that finished everything it set out to do ends the
+    # capture itself, and the operator's --seconds was the ceiling the docs
+    # tell them to pass, not a window owed. Holding such a run to the window
+    # failed every storage-cache selftest on "185s of the 500s requested",
+    # with the scenario's own `result=done` sitting in the same log. Only
+    # `done` earns the exemption: any other result is already a strict
+    # failure, and a `duration` or `stream-ended` stop keeps the contract.
+    finished_itself = (
+        end is not None
+        and end.get("stop_reason") == "selftest"
+        and any(
+            event.get("event") == "selftest_done" and event.get("result") == "done"
+            for event in run.events
+        )
+    )
     # A run with no `run_end` at all is already reported as truncated, so the
     # duration check stays quiet rather than saying the same thing twice.
-    if isinstance(seconds, int) and end is not None:
+    if isinstance(seconds, int) and end is not None and not finished_itself:
         elapsed = end.get("elapsed_s")
         if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool):
             warnings.append(
@@ -2541,25 +3041,72 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
                 "captured; the run is short of the window it was asked for"
             )
 
-    turns = requested.get("page_turns")
-    if isinstance(turns, int):
-        paired = len(page_turn_stats_over_epochs(run.events).durations)
-        if paired < turns:
+    # A request for N samples is met by two counts, and a self-driven
+    # capture owes both. The firmware's typed checkpoints, counted from
+    # where the capture joined, say the device completed N operations with
+    # their postconditions checked; without that count a late attach one
+    # checkpoint short of its target that ran on to `result=done` passed on
+    # the partial operation the stop rule had excluded. The telemetry the
+    # statistics are drawn from says the host captured N measurements; a
+    # checkpoint survives a dropped render line, and a report of fifty turns
+    # over forty-nine samples would be certified against the wrong
+    # population. A manual capture carries no checkpoint and owes only the
+    # telemetry.
+    self_driven = is_self_driven(run.events)
+
+    def short(
+        label: str,
+        requested_n: int,
+        measured: int,
+        completed: int | None,
+        detail: str = "",
+    ) -> None:
+        if completed is not None and completed < requested_n:
             warnings.append(
-                f"{run.label}: {paired} of {turns} requested page turns "
+                f"{run.label}: {completed} of {requested_n} requested {label} "
                 "captured; the run is short of the sample count it was asked "
                 "for"
             )
+        elif measured < requested_n:
+            if completed is None:
+                warnings.append(
+                    f"{run.label}: {measured} of {requested_n} requested {label} "
+                    f"captured{detail}; the run is short of the sample count it "
+                    "was asked for"
+                )
+            else:
+                warnings.append(
+                    f"{run.label}: the device completed {completed} {label} but "
+                    f"only {measured} of the {requested_n} requested were "
+                    f"measured{detail}; the telemetry for the rest is missing "
+                    "from the capture"
+                )
+
+    turns = requested.get("page_turns")
+    if isinstance(turns, int):
+        window = counted_window(run.events, "page_turn") if self_driven else run.events
+        short(
+            "page turns",
+            turns,
+            len(page_turn_stats_over_epochs(window).durations),
+            checkpoint_completions(run.events, "page_turn") if self_driven else None,
+        )
 
     entries = requested.get("folder_entries")
     if isinstance(entries, int):
-        entered = sum(1 for event in run.events if event.get("event") == "folder_enter")
-        if entered < entries:
-            warnings.append(
-                f"{run.label}: {entered} of {entries} requested folder "
-                "entries captured; the run is short of the sample count it "
-                "was asked for"
-            )
+        window = counted_window(run.events, "folder_leave") if self_driven else run.events
+        # A round trip is measured only with both halves present: the enter
+        # and leave populations feed separate budgets, and five leaves over
+        # four enters is four round trips, not five.
+        enters = len(folder_samples(window, "folder_enter"))
+        leaves = len(folder_samples(window, "folder_leave"))
+        short(
+            "folder round trips",
+            entries,
+            measured_folder_round_trips(window),
+            checkpoint_completions(run.events, "folder_leave") if self_driven else None,
+            detail=f" ({enters} entries and {leaves} leaves)",
+        )
 
     cycles = requested.get("sleep_cycles")
     if isinstance(cycles, int):
@@ -2656,6 +3203,7 @@ BUDGET_SECTION_WORKFLOWS: dict[str, set[str]] = {
     "page-turn": {"page-turn", "reader-soak"},
     "sleep-sync": {"sleep-sync"},
     "storage-cache": {"storage-cache"},
+    "folder-nav": {"folder-nav"},
 }
 
 

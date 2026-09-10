@@ -6,6 +6,13 @@ edition = "2021"
 [lints]
 workspace = true
 
+[features]
+# Count directory entries per walk phase, so a bench capture can say whether a
+# slow folder entry is spent resolving the path or iterating the folder. Pure
+# counters read and reset by the caller; nothing here has a clock. Off in
+# every shipped build. See fw::bench_selftest and docs/agents/bench.md.
+bench-selftest = []
+
 [dependencies]
 # The rev, and why it is that rev, live in the root manifest's
 # [workspace.dependencies].

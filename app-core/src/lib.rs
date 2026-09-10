@@ -3294,6 +3294,65 @@ fn swap_front_pairs(front_buttons: FrontButtons, button: Option<Button>) -> Opti
     })
 }
 
+/// The physical key that reaches `action` under these settings.
+///
+/// `apply_input` runs a raw key through the front-pair swap and then the
+/// orientation before the reducer sees it, so the key a hand presses and the
+/// action it performs are only the same thing on the default settings.
+/// `PagesLeft` turns a raw `Next` into `Confirm`, and `LandscapeButtonsTop`
+/// turns it into `Back`. Anything that synthesises input rather than reading
+/// the ADC has to send the key that produces the action it means, or it does
+/// whatever the reader last saved in Settings.
+///
+/// Brute force over the seven keys rather than a hand-written inverse: both
+/// maps are small, `orient_button`'s is not an involution, and a second table
+/// would drift from the ones it inverts without anything failing loudly.
+///
+/// `view` matters because Home skips the front-pair swap. See [`arrives_as`].
+///
+/// `None` means no key reaches that action here, which no current mapping
+/// produces (both are permutations) but is the honest answer if one stops
+/// being one.
+pub fn physical_key_for(
+    view: AppView,
+    orientation: DisplayOrientation,
+    front_buttons: FrontButtons,
+    action: Button,
+) -> Option<Button> {
+    const KEYS: [Button; 7] = [
+        Button::Power,
+        Button::Back,
+        Button::Confirm,
+        Button::Previous,
+        Button::Next,
+        Button::PagePrevious,
+        Button::PageNext,
+    ];
+    KEYS.into_iter()
+        .find(|&raw| arrives_as(view, orientation, front_buttons, raw) == Some(action))
+}
+
+/// What a raw key arrives as in `view`, mirroring `apply_input`'s two maps.
+///
+/// The view is part of the question because Home is positional rather than
+/// grammatical: it direct-maps the physical key column and deliberately
+/// skips the front-pair swap, so the same raw key means one thing at Home
+/// and another everywhere else. Inverting both maps regardless put the
+/// selftest on the wrong Home row under `PagesLeft`, asking for Confirm
+/// (continue reading) and landing on Settings.
+fn arrives_as(
+    view: AppView,
+    orientation: DisplayOrientation,
+    front_buttons: FrontButtons,
+    raw: Button,
+) -> Option<Button> {
+    if view == AppView::Home {
+        orient_button(orientation, Some(raw))
+    } else {
+        orient_button(orientation, swap_front_pairs(front_buttons, Some(raw)))
+    }
+}
+
 fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Option<Button> {
     let button = button?;
     Some(match orientation {
@@ -6850,6 +6909,125 @@ mod tests {
         }
         // Uploads only exist while the browser shelf is being served.
         assert!(!session.admits(&StorageCommand::ReceiveUpload));
+    }
+
+    #[test]
+    fn physical_key_reaches_the_action_it_names_under_every_setting() {
+        use DisplayOrientation::*;
+        use FrontButtons::*;
+        let orientations = [
+            LandscapeButtonsBottom,
+            LandscapeButtonsTop,
+            PortraitButtonsLeft,
+            PortraitButtonsRight,
+        ];
+        let actions = [
+            Button::Power,
+            Button::Back,
+            Button::Confirm,
+            Button::Previous,
+            Button::Next,
+            Button::PagePrevious,
+            Button::PageNext,
+        ];
+        let views = [
+            AppView::Home,
+            AppView::Library,
+            AppView::Reading,
+            AppView::Chapters,
+            AppView::Wireless,
+            AppView::Settings,
+        ];
+        for view in views {
+            for orientation in orientations {
+                for front in [PagesRight, PagesLeft] {
+                    for action in actions {
+                        let key = physical_key_for(view, orientation, front, action)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "no key reaches {action:?} in {view:?} on {orientation:?}/{front:?}"
+                                )
+                            });
+                        // The point of the inverse: pressing what it returns
+                        // has to arrive as what was asked for, through the
+                        // maps that view actually applies.
+                        assert_eq!(
+                            arrives_as(view, orientation, front, key),
+                            Some(action),
+                            "{key:?} did not reach {action:?} in {view:?} on {orientation:?}/{front:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swapped_front_pair_moves_a_page_turn_off_the_next_key() {
+        // The concrete case the bench injector kept getting wrong: on
+        // PagesLeft a raw Next arrives as Confirm, so a scenario that sent
+        // Next to turn a page opened the chapter list instead.
+        assert_eq!(
+            orient_button(
+                DisplayOrientation::PortraitButtonsLeft,
+                swap_front_pairs(FrontButtons::PagesLeft, Some(Button::Next))
+            ),
+            Some(Button::Confirm)
+        );
+        assert_eq!(
+            physical_key_for(
+                AppView::Reading,
+                DisplayOrientation::PortraitButtonsLeft,
+                FrontButtons::PagesLeft,
+                Button::Next
+            ),
+            Some(Button::Confirm)
+        );
+    }
+
+    #[test]
+    fn home_continue_reading_survives_either_front_pair() {
+        // Home is positional and skips the front-pair swap, so inverting
+        // both maps put the selftest on the wrong row: asking for Confirm
+        // (continue reading) under PagesLeft produced raw Next, which Home
+        // reads as Settings. Driven through the reducer rather than the
+        // action table, so it tests the path the device takes.
+        // The invariant the fix rests on, asserted before the walk so a
+        // regression names itself: Home ignores the front pair, so the key
+        // that continues reading there cannot depend on it. Inverting the
+        // swap made these two differ, which is the whole defect.
+        let orientation = ReaderState::boot().orientation;
+        assert_eq!(
+            physical_key_for(
+                AppView::Home,
+                orientation,
+                FrontButtons::PagesRight,
+                Button::Confirm
+            ),
+            physical_key_for(
+                AppView::Home,
+                orientation,
+                FrontButtons::PagesLeft,
+                Button::Confirm
+            ),
+        );
+
+        for front in [FrontButtons::PagesRight, FrontButtons::PagesLeft] {
+            let mut state = ReaderState::boot();
+            state.view = AppView::Home;
+            state.front_buttons = front;
+            // An SD book is already current, so continuing goes straight to
+            // Reading rather than by way of the shelf.
+            state.book_id = FIRST_SD_BOOK_ID;
+            let key = physical_key_for(state.view, state.orientation, front, Button::Confirm)
+                .expect("a key reaches Confirm at Home");
+            state = state.apply_input(CTX, InputEvent::button(key));
+            assert_eq!(
+                state.view,
+                AppView::Reading,
+                "{key:?} did not continue reading at Home on {front:?}"
+            );
+        }
     }
 
     #[test]

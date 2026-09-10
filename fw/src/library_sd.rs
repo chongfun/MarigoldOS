@@ -1092,6 +1092,8 @@ pub(crate) fn choose_library_row(
     portrait: bool,
 ) -> RowChoice {
     let started = Instant::now();
+    #[cfg(feature = "bench-selftest")]
+    let _ = upload_store::library::walk_probe::take();
     let chosen = sd_session::with_root(epd, sd_cs, |root| {
         reader_cache::browse::choose_row(library, root, index, portrait)
     });
@@ -1108,6 +1110,7 @@ pub(crate) fn choose_library_row(
                 started.elapsed().as_millis(),
                 Instant::now().as_millis(),
             );
+            log_folder_walks();
             RowChoice::Entered(listing)
         }
         Ok(reader_cache::browse::RowChoice::Book { at, locator, size }) => {
@@ -1154,6 +1157,8 @@ pub(crate) fn leave_library_folder(
     portrait: bool,
 ) -> Option<Listing> {
     let started = Instant::now();
+    #[cfg(feature = "bench-selftest")]
+    let _ = upload_store::library::walk_probe::take();
     let listed = sd_session::with_root(epd, sd_cs, |root| {
         reader_cache::browse::leave_folder(library, root, portrait)
     })
@@ -1170,8 +1175,32 @@ pub(crate) fn leave_library_folder(
         started.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
+    log_folder_walks();
     listed
 }
+
+/// Split the folder operation just logged into its walks, bench builds only.
+///
+/// `folder_enter` and `folder_leave` report one elapsed time for what is
+/// really several directory walks, each of which first scans the parent to
+/// resolve its path and then iterates the folder. The two phases scale with
+/// different things, so a slow folder cannot be attributed from the total.
+/// This line says how many walks ran and how many entries each phase
+/// visited; the counters are per operation, reset before the walk above.
+#[cfg(feature = "bench-selftest")]
+fn log_folder_walks() {
+    let (walks, resolve_entries, iterate_entries) = upload_store::library::walk_probe::take();
+    bench_log!(
+        "bench: folder_walks walks={} resolve_entries={} iterate_entries={} t_ms={}",
+        walks,
+        resolve_entries,
+        iterate_entries,
+        Instant::now().as_millis(),
+    );
+}
+
+#[cfg(not(feature = "bench-selftest"))]
+fn log_folder_walks() {}
 
 /// Make `index` the active book by reading its catalog record into the store,
 /// so the reading path's `catalog_entry(index)` resolves without depending on

@@ -39,3 +39,15 @@ catalog_load_warn_ms = 500
 # section_extend_warn_ms was deleted 2026-07-30: no section-extend telemetry
 # exists for it to gate (extends surface as `storage_open` with ram_hit), and
 # a budget key that looks enforced but is read by nothing is worse than none.
+
+[folder-nav]
+# Entering and leaving a folder, each its own storage operation with its own
+# telemetry. Sized from the first device capture of this suite, 2026-09-09,
+# X3, an unattended bench-selftest walk of 20 round trips: entry 37-38 ms
+# into a 6-row folder and 86-87 ms into a 14-row one, leave 38-40 ms
+# throughout. The ceilings sit well above both so a legitimate change cannot
+# trip them, and far below the 40 ms per-row cost an O(rows) regression
+# would add on a large folder. Successful operations only: a refused leave
+# is a card fault, gated by the suite check, not a slow sample.
+folder_enter_warn_ms = 200
+folder_leave_warn_ms = 150

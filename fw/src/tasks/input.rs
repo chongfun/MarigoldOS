@@ -318,6 +318,31 @@ fn battery_percent(aux_mv: u16) -> u8 {
     (((mv - 3300) as u32 * 100) / 900) as u8
 }
 
+/// Log a press the scenario injected, in the shape a real one takes plus
+/// the action it meant.
+///
+/// The harness pairs a press to a render through this line, so an injected
+/// press that skips it is invisible to `page turn` and the capture comes
+/// home with renders and no durations. The line keeps the real press's
+/// `button=` field, the physical key the reducer will see, and adds
+/// `action=`, the logical action the scenario asked for. They differ under a
+/// swapped front pair or a flipped orientation, and the host pairs on the
+/// action when it is present, so a genuine page turn on PagesLeft, whose key
+/// is Confirm, still counts. A manual capture carries no `action=` and reads
+/// exactly as before.
+#[cfg(feature = "bench-selftest")]
+pub(crate) fn log_injected_input(button: Button, action: Button) {
+    bench_log!(
+        "bench: input button={:?} action={:?} aux={} nav={} page_raw={} t_ms={}",
+        Some(button),
+        action,
+        2000,
+        0,
+        0,
+        Instant::now().as_millis(),
+    );
+}
+
 fn log_input(button: Option<Button>, sample: RawSample) {
     bench_log!(
         "bench: input button={:?} aux={} nav={} page_raw={} t_ms={}",

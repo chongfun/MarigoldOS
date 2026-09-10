@@ -205,6 +205,56 @@ impl Lookup {
 }
 
 /// Walk `dir` once, offering every entry to `selector`.
+/// Per-phase entry counters for one folder operation, bench builds only.
+///
+/// A folder entry is several directory walks, and each walk first resolves
+/// its path by scanning the parent until the component's exact name turns
+/// up, then iterates the folder itself. The two phases scale with different
+/// things: resolution with where the folder sits in its parent's directory
+/// order, iteration with what the folder holds. A single elapsed time cannot
+/// tell them apart, and this crate has no clock, so the probe counts entries
+/// instead. Counts are what the two hypotheses predict, and they repeat
+/// exactly from run to run where milliseconds drift.
+///
+/// Plain load and store rather than fetch_add: riscv32imc has no CAS, and the
+/// SD bus has one owner by contract, so there is no second writer to race.
+#[cfg(feature = "bench-selftest")]
+pub mod walk_probe {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static WALKS: AtomicUsize = AtomicUsize::new(0);
+    static RESOLVE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+    static ITERATE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+
+    fn bump(counter: &AtomicUsize) {
+        counter.store(counter.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn walk() {
+        bump(&WALKS);
+    }
+    pub(crate) fn resolve_entry() {
+        bump(&RESOLVE_ENTRIES);
+    }
+    pub(crate) fn iterate_entry() {
+        bump(&ITERATE_ENTRIES);
+    }
+
+    /// The counts since the last take, then zero: (walks, entries scanned
+    /// while resolving paths, entries iterated inside folders).
+    pub fn take() -> (usize, usize, usize) {
+        let out = (
+            WALKS.load(Ordering::Relaxed),
+            RESOLVE_ENTRIES.load(Ordering::Relaxed),
+            ITERATE_ENTRIES.load(Ordering::Relaxed),
+        );
+        WALKS.store(0, Ordering::Relaxed);
+        RESOLVE_ENTRIES.store(0, Ordering::Relaxed);
+        ITERATE_ENTRIES.store(0, Ordering::Relaxed);
+        out
+    }
+}
+
 fn scan_into<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     component: &str,
@@ -217,6 +267,8 @@ where
     let mut storage = [0u8; LFN_SCAN_BYTES];
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
     let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
+        #[cfg(feature = "bench-selftest")]
+        walk_probe::resolve_entry();
         if entry.attributes.is_volume() {
             return ControlFlow::Continue(());
         }
@@ -305,6 +357,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    #[cfg(feature = "bench-selftest")]
+    walk_probe::walk();
     let mut here: Option<Directory<'_, D, T, MD, MF, MV>> = None;
     for component in path.components() {
         let dir = here.as_ref().unwrap_or(root);
@@ -466,6 +520,8 @@ where
         let mut storage = [0u8; LFN_SCAN_BYTES];
         let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
         let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
+            #[cfg(feature = "bench-selftest")]
+            walk_probe::iterate_entry();
             if entry.attributes.is_volume() {
                 return ControlFlow::Continue(());
             }
