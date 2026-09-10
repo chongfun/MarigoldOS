@@ -120,7 +120,7 @@ read as "SD is ruled out". It is not.
 
 The arithmetic, from this roadmap's own measured numbers: 3.2 MB / 19.3 s =
 166 KB/s = **3.08 ms of budget per 512-byte block**, against a measured
-**2.23 ms per block write**. That is **~72% of upload wall time in single-block
+**2.23 ms per block write** (on the card in use in July, since retired; the 8 GB card measured 4.8 ms per block on 2026-09-09 and the figure is per-card, see the PRD's baseline notes). That is **~72% of upload wall time in single-block
 SD writes**, and the pure SD ceiling (512 B / 2.23 ms = 229 KB/s) sits only
 **1.4×** above the observed throughput. *Load-bearing caveat: the 2.23 ms was
 measured on the cold-build workload (scattered small cache writes), not on

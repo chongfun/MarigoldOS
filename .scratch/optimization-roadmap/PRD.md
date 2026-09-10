@@ -256,7 +256,7 @@ below, per rule 13.
 | Render flush, Fast | 404 ms median (379 ms of it panel BUSY) |
 | Full refresh | two BUSY intervals per Full render: 928 ms waveform + 379 ms clean pass, flush 1,764 ms |
 | Prestage | 24 ms |
-| Progress write | **88 ms** median (was 42 in July; not explained, see below) |
+| Progress write | **88 ms** median on the 8 GB card, 74 on the 64 GB card (was 42 in July on a card since retired). Card-bound: see below |
 | **Page turn, press-to-settled** | **426 ms** median, 427 p95, 412 min, 438 max, queue wait 0 |
 | Warm book open (cache built, RAM miss) | 65 to 137 ms, median 87, p95 126 (n=21), foldered card |
 | Catalog load | 47 ms |
@@ -265,12 +265,40 @@ below, per rule 13.
 | Boot to first paint, cold | 3,086 ms (`x3 init done` at 1,318 ms) |
 | Boot to first paint, timer wake from deep sleep | 2,173 ms median (2,161 to 2,185, n=2) |
 
-Two things in that table are new information rather than confirmation. The
-progress write has doubled since the July capture, 42 to 88 ms, on the same
-board and the same card class; nothing in this document predicted it and it
-is unassigned. Boot- and wake-to-first-paint had been listed below as never
-measured; they are now, and the 913 ms between them is the Full refresh a
-cold boot pays and a wake does not, plus the difference in `x3 init done`.
+Two things in that table are new information rather than confirmation.
+
+The progress write doubled between July and now, 42 to 88 ms, and an
+investigation on 2026-09-10 split it on the device. A progress write is two
+durable files, the global state record and the per-book position, each a
+two-generation write of six card operations: read A, read B, open-truncate
+the target, write it, close it, read it back. On the 8 GB card one such file
+costs 32 ms, of which the three write-side operations cost 28 (truncate 7.8,
+data write 5.1, close with its directory and FAT update 14.6, up to 33) and
+the three reads 9. On a freshly formatted 64 GB card with the same content,
+the same file costs 27 ms (writes 23, reads 4). #88 adds a catalog-record
+read and a claim-file read per progress write, measured at 8 ms by an A/B
+that alternated the #87 position path with the current one on successive
+writes. So the figure is card-bound: the cards differ by two in single-sector
+program latency (a cold build wrote at 2.2 to 2.5 ms per block on the
+August card and 4.8 on the 8 GB one), the code's share of the change is 8 ms,
+and nothing in the SD driver or the write primitives changed. What the
+split does point at is the write protocol itself: three separate
+sector-write operations per file where an in-place overwrite of a fixed-size
+record would need one plus the directory timestamp, and a read-back verify
+on every write. That is a candidate item for issue 02 or WS-D, sized here
+at roughly 15 to 20 ms per progress write, and it is the only part of this
+number the firmware controls.
+
+Boot- and wake-to-first-paint had been listed below as never measured; they
+are now, and the 913 ms between them is the Full refresh a cold boot pays
+and a wake does not, plus the difference in `x3 init done`.
+
+The 64 GB card also moved every other storage figure: warm open 36 to 64 ms
+(from 65 to 137), folder enter 28 to 29 ms (from 49 to 87), folder leave 17
+to 19 ms (from 39 to 41), with the display figures unchanged to the
+millisecond. Every storage baseline in this document is therefore a
+per-card figure and should name the card it was taken on; the 8 GB card is
+the reference until the roadmap says otherwise.
 
 **Display, X3, deliberate cadence, 50 turns (2026-07-27, main `e9163b3`).**
 Superseded by the table above; kept for the comparison.
