@@ -23,8 +23,18 @@ reading_layout_warn_ms = 60
 prestage_warn_ms = 40
 
 [sleep-sync]
-full_refresh_busy_min_ms = 3000
-full_refresh_busy_max_ms = 4300
+# A Full refresh on the X3 is two BUSY intervals, not one: the driver runs
+# the full waveform (928 ms measured, n=16 in 2026-07 and every unattended
+# capture since) and then a 379 ms clean pass, and both are logged as
+# `refresh mode=Full`. The floor and ceiling bracket both intervals. The
+# 3000/4300 pair they replace was sized from a "~3.5 s Full" figure the
+# roadmap retired in 2026-07-30; it failed every strict X3 sleep-sync run
+# from the day --strict started working (roadmap Tier 0, item 3) until this
+# re-sizing on 2026-09-10 from the first unattended main baseline. The floor
+# still catches a Full that did not drive the panel (a 136 ms controller
+# interval alone), the ceiling a waveform that has slowed.
+full_refresh_busy_min_ms = 300
+full_refresh_busy_max_ms = 1100
 
 [storage-cache]
 # Warm book opens only: `storage_open` with `ram_hit=false` and no cache build
@@ -34,7 +44,13 @@ full_refresh_busy_max_ms = 4300
 # 0-15 ms, cold builds at 14-64 *seconds*), so a cold open failed the warm
 # ceiling and a RAM hit pulled the percentile back under it. Cold opens scale
 # with book size; the report prints them per path and gates none.
-warm_book_open_warn_ms = 150
+# Re-sized 2026-09-10 from 150. The 57-95 ms population was measured on a
+# flat card; on the foldered card the same open is 65-137 ms across four
+# unattended captures on main 72b24f3 (n=21, median 87, p95 126), so 150 left
+# 13 ms of margin for a gate meant to catch an O(n) regression. One 639 ms
+# warm open was recorded on 2026-09-09 right after the walk descended the
+# folder tree; it is filed as a roadmap finding, not sized into this budget.
+warm_book_open_warn_ms = 200
 catalog_load_warn_ms = 500
 # section_extend_warn_ms was deleted 2026-07-30: no section-extend telemetry
 # exists for it to gate (extends surface as `storage_open` with ram_hit), and
