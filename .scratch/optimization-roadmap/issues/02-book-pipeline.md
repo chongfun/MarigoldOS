@@ -278,9 +278,11 @@ card, none yet assigned an item.
   They are filtered, but each still costs a FAT directory-entry read on
   every walk. Entering that folder is 85 to 87 ms against 49 to 50 ms for a
   7-row one, so the hidden half of the listing is a real share of the entry
-  cost. A card-side clean removes them; a firmware-side early reject on the
-  `._` prefix before the name is decoded would make the cost proportional
-  to visible rows.
+  cost. The fix is firmware-side, an early reject on the `._` prefix before
+  the name is decoded, so the cost becomes proportional to visible rows.
+  Cleaning the card is not it: a library managed from a Mac always carries
+  these entries, so the bench card keeps them by decision (2026-09-10) and
+  every folder figure in this document was measured with them present.
 - **A mixed folder is walked three times per entry.** Resolving entries and
   iterating them are separate walks and a folder holding both books and
   subfolders paid a third. Each walk re-resolves the path from the root
