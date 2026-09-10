@@ -287,6 +287,27 @@ cannot model waveform physics — this is pure hardware validation
 (`page-turn` BUSY distribution, `thermal-run` cold/warm, long `reader-soak`
 for ghost accumulation).
 
+### A18 (finding, 2026-09-10): a turn across a one-page section costs two Fast refreshes
+
+Found while calibrating the unattended page-turn injector against a hand
+(#90). On a book whose sections are a page long, a turn that crosses a
+section sends an extend, and `loaded_repaints` repaints the page when the
+section loads: a second Fast refresh carrying the replaced text, requested a
+median of 2 ms after the first frame settles with a tail to 1,071 ms. An
+injector pressing the instant the first frame settled superseded and hid
+it (56 refreshes in 50 turns); at reading cadence the hand and the injector
+both pay it (82 and 68 refreshes in 50). The reader sees the page paint
+twice, and on a slow section load the second paint can land more than a
+second after the first.
+
+What it is not: a duplicate-frame problem A14 would catch, since the two
+frames differ (placeholder text, then loaded text). Whether the first paint
+should wait for a load that usually completes within the flush, or the
+second should be suppressed when the loaded text matches what was drawn, is
+a design question for whoever next touches `loaded_repaints`. Measure the
+section-load distribution first; the fix depends on where the 1,071 ms tail
+comes from.
+
 ## Done
 
 - **A1** (#12) — send `DisplayEvent::Settled` before the prestage and chapter

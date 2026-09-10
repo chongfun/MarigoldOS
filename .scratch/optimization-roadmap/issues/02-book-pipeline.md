@@ -266,6 +266,35 @@ custom-font builds still measure slow, what is left is (a) General-Punctuation
 slot runs and (b) holding the pack handle across the whole spine walk rather
 than per run. Measure before building either.
 
+### 8. Folder walk costs, measured by the unattended harness (2026-09-10)
+
+Three findings from the #90 folder-nav work, all on the X3 with the folder
+card, none yet assigned an item.
+
+- **A 14-row folder iterates 32 directory entries per walk.** The per-walk
+  entry counter (`upload_store::library::walk_probe`, behind the
+  `bench-selftest` feature) shows about one hidden entry per visible row:
+  macOS sidecars (`._*`, `.DS_Store`) the card picked up from the host.
+  They are filtered, but each still costs a FAT directory-entry read on
+  every walk. Entering that folder is 85 to 87 ms against 49 to 50 ms for a
+  7-row one, so the hidden half of the listing is a real share of the entry
+  cost. A card-side clean removes them; a firmware-side early reject on the
+  `._` prefix before the name is decoded would make the cost proportional
+  to visible rows.
+- **A mixed folder is walked three times per entry.** Resolving entries and
+  iterating them are separate walks and a folder holding both books and
+  subfolders paid a third. Each walk re-resolves the path from the root
+  (`resolve_entries`), so path resolution is repeated per walk. Collapsing
+  to one walk per entry is the obvious item; size it against the 41 ms +
+  0.356 ms/row model in `docs/ARCHITECTURE.md` before writing it.
+- **One 639 ms warm book open after a folder descent.** Recorded 2026-09-09
+  in a storage-cache capture whose walk went through the folder tree to
+  reach a book; every other warm open in that capture and the four since
+  is 65 to 137 ms. A single sample, reproducible or not is unknown, and it
+  is the reason the warm-open budget in PR #91 was sized from the
+  population rather than the maximum. If it recurs, the suspect is the
+  path resolution above happening inside the open.
+
 ## Done
 
 - **B2+B3** (#10) — catalog scan O(C×N) → O(C+N), title persisted in the

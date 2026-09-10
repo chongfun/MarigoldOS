@@ -122,7 +122,11 @@ is the opposite of what was expected when this started.
    "~3.5 s Full" figure this round retired, sitting in an enforced budget.
    Now that `--strict` actually works, **every strict X3 sleep-sync run will
    fail on it.** Left untouched deliberately: it is a real finding about the
-   budget, not about the harness.
+   budget, not about the harness. **Re-sized in PR #91 (2026-09-10)** to a
+   300 to 1100 ms bracket, once the unattended baseline showed the X3's Full
+   is two BUSY intervals, 928 ms of waveform and a 379 ms clean pass, both
+   logged as `mode=Full`. The warm-open budget was re-sized in the same PR,
+   150 to 200 ms, from a 65 to 137 ms population on the foldered card.
 
 ### Tier 1 — large, cheap, high confidence
 
@@ -237,8 +241,39 @@ without merging, so it is not listed here; see Tier 3.
 
 ## Current measured baselines
 
+**X3, unattended, main `72b24f3` (2026-09-10).** Quote these, not anything
+older. Taken by the `bench-selftest` build that #90 landed, with nobody at
+the keys: page-turn (50 turns at the 1.5 s quiet cadence calibrated against
+a hand), sleep-sync (3 cycles), storage-cache (to its own `result=done`) and
+folder-nav (20 round trips), each `--strict` clean against the PR #91
+budgets. Captures are `base-*.jsonl` in the session scratchpad; the recipe
+is `docs/agents/bench.md`. This is the before-capture for every WS-A item
+below, per rule 13.
+
+| Metric | Value |
+|---|---|
+| Reading layout, portrait | 16 ms median / 17 p95 |
+| Render flush, Fast | 404 ms median (379 ms of it panel BUSY) |
+| Full refresh | two BUSY intervals per Full render: 928 ms waveform + 379 ms clean pass, flush 1,764 ms |
+| Prestage | 24 ms |
+| Progress write | **88 ms** median (was 42 in July; not explained, see below) |
+| **Page turn, press-to-settled** | **426 ms** median, 427 p95, 412 min, 438 max, queue wait 0 |
+| Warm book open (cache built, RAM miss) | 65 to 137 ms, median 87, p95 126 (n=21), foldered card |
+| Catalog load | 47 ms |
+| Folder enter | 49 to 50 ms into a 7-row folder, 85 to 87 ms into a 14-row one |
+| Folder leave | 39 to 41 ms |
+| Boot to first paint, cold | 3,086 ms (`x3 init done` at 1,318 ms) |
+| Boot to first paint, timer wake from deep sleep | 2,173 ms median (2,161 to 2,185, n=2) |
+
+Two things in that table are new information rather than confirmation. The
+progress write has doubled since the July capture, 42 to 88 ms, on the same
+board and the same card class; nothing in this document predicted it and it
+is unassigned. Boot- and wake-to-first-paint had been listed below as never
+measured; they are now, and the 913 ms between them is the Full refresh a
+cold boot pays and a wake does not, plus the difference in `x3 init done`.
+
 **Display, X3, deliberate cadence, 50 turns (2026-07-27, main `e9163b3`).**
-Quote these, not anything older.
+Superseded by the table above; kept for the comparison.
 
 | Metric | Value |
 |---|---|
@@ -287,8 +322,8 @@ prints take a blocking UART path — see Tier 0d. The numbers are not wrong;
 they describe a device plugged into a laptop, which is not the shipped one.
 
 **Never measured:** deep-sleep current or any other power figure at any
-operating point (C2); the upload throughput ceiling's cause; boot- and
-wake-to-first-paint, though the data is already in every capture on disk.
+operating point (C2); the upload throughput ceiling's cause. Boot- and
+wake-to-first-paint came off this list on 2026-09-10 (table above).
 **Still true of *this* firmware after the 2026-08-13 sweep** — but upstream now
 has X3 figures from a PPK2 at the battery terminals (deep sleep **12.8 µA**,
 static-page idle **9.68 mA** before their light-sleep work, **2.78 mA** after;
