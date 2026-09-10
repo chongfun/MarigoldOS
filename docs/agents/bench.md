@@ -20,6 +20,367 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 5
 tools/bench/bench.py storage-cache --port /dev/cu.usbmodem101 --reset-before --seconds 20 --strict
 ```
 
+## Unattended captures: the `bench-selftest` build
+
+`bench.py` listens; it cannot press a key. Every suite below is therefore
+operator-driven, which puts the operator's cadence inside the measurement.
+A firmware built with the `bench-selftest` feature presses the keys itself:
+
+```sh
+tools/cargo.sh build --release -p fw --features device-x3,bench-selftest
+espflash flash --chip esp32c3 --flash-size 16mb --partition-table partitions.csv \
+  --ignore-app-descriptor --port /dev/cu.usbmodemXXXX \
+  target/riscv32imc-unknown-none-elf/release/fw
+tools/bench/bench.py page-turn --port /dev/cu.usbmodemXXXX --reset-before \
+  --turns 50 --seconds 200 --strict
+```
+
+The scenario waits out the boot paint, walks to Reading by watching which
+view each press actually lands on, waits for the device to stop painting on
+its own, then turns pages one settled render at a time. Cadence comes from
+the settle rather than a host timer, so presses cannot land mid-refresh.
+
+Read the numbers with two things in mind.
+
+- **Cadence is part of the measurement, and the injector now waits for
+  quiet.** Calibrated 2026-09-09 on the X3 against a hand-pressed run on the
+  same book in the same warm regime, 50 clean pairings every leg:
+
+  | injector cadence | median | min | p95 | max | queue wait | refreshes / 50 |
+  |---|---|---|---|---|---|---|
+  | hand-pressed, ~2 s | 418 | 411 | 434 | 456 | 0 ms | 82 |
+  | press at settle + 0 | 433 | 411 | 434 | 455 | 22 ms | 56 |
+  | press at settle + 50 ms | 845 | 425 | 857 | 867 | 397 ms | 96 |
+  | press after 1.5 s quiet | 426 | 412 | 427 | 428 | 1 ms | 68 |
+
+  Three things this settled. Pressing the instant a render settles lands the
+  press behind the display task's 24 ms prestage, which is the 22 ms of queue
+  wait and the whole of the first 15 ms gap; the ADC stage the injector skips
+  is worth a few milliseconds the other way. Pressing 50 ms later is worse,
+  because a page turn that crosses a section boundary sends an extend and
+  `loaded_repaints` repaints the page when the section loads: a second Fast
+  refresh, about 400 ms, requested a median of 2 ms after the settle but with
+  a tail to 735 ms in an injected run and 1,071 ms in the hand-pressed one.
+  A press at settle plus zero supersedes that repaint, so the tight injector
+  saw one refresh per turn where the hand saw 82 in 50; a press at settle
+  plus 50 waits behind it; a 600 ms quiet window tried in between returned
+  inside the tail on 6 of 50 turns and paid two flushes each. Waiting until
+  no frame has settled for 1.5 s clears the measured tail and matches the
+  deliberate cadence a reader used, and the residual against the hand-pressed
+  run is 8 ms at the median with minima one millisecond apart.
+
+  So an injected median is comparable to an operator baseline as it stands,
+  and the refresh count now shows the repaints rather than hiding them. Two
+  findings belong to the roadmap rather than here: on a book whose sections
+  are a page long, every turn at reading cadence costs two Fast refreshes,
+  and the repaint that carries the replaced text can arrive more than a
+  second after the page first painted.
+- **The book and the card still decide the figure.** The scenario opens
+  whatever the first row offers. A capture meant to compare against the
+  11.7 MB baseline book needs that book on the card and reachable, exactly
+  as a hand-driven one does.
+
+A measured example, X3, 50 turns, nobody touching the device:
+
+```
+page turn      median=433ms p95=453ms min=412ms max=472ms
+page inputs:   presses=50 page_turns=50 nav=0 coalesced=0 unmatched=0
+```
+
+Fifty presses, fifty pairings, nothing coalesced, `--strict` clean. The
+pooled operator captures on the same harness report `presses=101
+page_turns=70 nav=28 coalesced=3`, a 28-second maximum, and three runs
+excluded for cadence. That example predates the quiet-cadence change; the
+calibration table above is the current shape, with a 16 ms spread across
+fifty turns.
+
+One regime caveat the calibration also surfaced. A book opened cold by the
+injector is built by B4 and then read from RAM, two storage opens in fifty
+turns; the same book after a reboot pages from the card's cache, a dozen or
+more warm opens. Both legs of a comparison must be in the same regime, which
+in practice means a reset before each with the cache already built.
+
+**It presses keys on every boot**, so it is a bench build and not a reading
+one. Reflash without the feature to get the device back.
+
+### Re-verified on the squashed tip, 2026-09-09
+
+Every scenario ran on the X3 from the single squashed commit, with the folder
+card in and the quiet cadence on:
+
+| scenario | strict | what the run showed |
+|---|---|---|
+| `page-turn` | pass | median 427, min 411, p95 429, 50 of 50, queue wait 0 |
+| `storage-cache` | budget | 3 cycles, 36 of 36, `result=done`; warm open p95 274 ms against the 150 ms budget |
+| `folder-nav` | pass | 20 of 20 round trips, every leave ok, depth held, timings unchanged |
+| `reader-soak` | pass | two passes across two self-wakes, `jumped=true returned=true` on both, no invalid records |
+| `sleep-sync` | floor | 3 cycles, first-attempt sleeps, 1 Full across 3 boots, wake-to-paint 2,188 ms |
+
+The two non-passes are not the scenarios. sleep-sync fails only the
+pre-existing `full_refresh_busy_min_ms = 3000` floor, seven times over against
+a measured 929 ms Full, which the roadmap already records as stale. The
+storage-cache warm-open p95 is dragged by one 639 ms open: with folders on the
+card, `reach_reading` pressed Confirm three times in Library, descending into
+the tree, before a book opened, and the open that followed that walk was the
+slow one. That path did not exist when the 150 ms budget was set on a flat
+card. In the same run B4's background build finished a cache that had been
+partial through every earlier capture, 71 s during a Library idle, which is
+expected and worth knowing when reading warm-open percentiles near it.
+
+A second review round at the squashed tip found four boundary holes, fixed
+and re-run on the device the same day:
+
+- **The last leave's repaint is the render frozen after the leave, not the
+  first to settle.** The Back press renders at once, showing the folder as
+  Leaving with the depth unchanged, and the SD leave prints its line in about
+  40 ms, inside that render's flush. Accepting the first settle took the Back
+  render as the parent listing. The host now requires `req_ms` after the
+  leave's `t_ms`; on the device the completing render was requested 2 ms
+  after the last leave, and the Back render did not end the run.
+- **An injected press logs `action=` beside `button=`.** The key is what the
+  reducer sees; the action is what the scenario meant. Under `PagesLeft` the
+  key that turns a page is Confirm, so pairing on the key alone made fifty
+  real turns invisible. The host pairs on the action when present and reads
+  a manual capture exactly as before.
+- **A turn is a page that moved.** A `Next` at the last page redraws the page
+  because every input marks the frame dirty, and the settle counted as a
+  turn. The page is published beside the view now, and a settle that moved
+  nothing reports `invalid=end-of-book` and stops. Driven to the end of a
+  393-page book on the device: turn 21 redrew page 392, 21 turns counted,
+  `result=short-turns`, strict failed on three named reasons. The host's own
+  pairing still counts that redraw, 22 against 21, because a press did
+  produce a render; the record stops certification.
+- **A quiet wait that runs out its budget is a record, not prose.** Four
+  callers were noting it and carrying on. They now write
+  `invalid=not-quiescent` and carry on, so the evidence is kept and cannot
+  certify.
+
+A third review round found the last boundary: the host stopped a count-bounded
+capture before the firmware had decided the final operation, so a failing
+verdict on the last turn or leave could be lost and the run certified. The
+`completed=` checkpoint above is the fix. Re-run on the device: folder-nav
+stopped on `completed=folder_leave count=20` with the verdict in hand;
+page-turn from a book left on its last page met the end of the book on its
+first press, wrote `invalid=end-of-book`, ended on `result=short-turns`, and
+refused certification, and from a book opened mid-way it stopped on
+`completed=page_turn count=50`, strict clean.
+
+One harness rule came out of the pass. A scenario that ends its own capture
+with `result=done` owes no `--seconds` window: the seconds were the ceiling
+these docs tell you to pass, and holding the run to them failed every
+storage-cache selftest on "185s of the 500s requested" with `done` in the
+same log. Only `done` earns that; a clock stop or a non-done result keeps
+the contract.
+
+### Choosing a scenario
+
+`BENCH_SCENARIO` picks one at build time, defaulting to `page-turn`. Every
+scenario is compiled into every bench build, so the variable selects rather
+than gates, and `fw/build.rs` reruns on it so a changed value actually
+changes the image:
+
+```sh
+BENCH_SCENARIO=folder-nav tools/cargo.sh build --release -p fw \
+  --features device-x3,bench-selftest
+```
+
+Compile time and not run time because there is nothing to ask. The radio is
+off by design, and the firmware reads no serial, so a flash is the control
+channel. Naming a scenario that does not exist prints the valid list and
+does nothing, rather than quietly running the default under the wrong name.
+
+| `BENCH_SCENARIO` | What it drives | What the card needs |
+|---|---|---|
+| `page-turn` | Opens a book, turns 50 pages | The book you mean to time, reachable from the first row |
+| `storage-cache` | Three open/read/back cycles, 12 turns each | Enough pages to cross a section boundary |
+| `folder-nav` | 20 enter-and-leave round trips, 3 cursor steps apart | **Folders.** On a flat card every row is a book, so the run reports 0 folder entries and `--strict` fails, correctly. First measured 2026-09-09 on a foldered card: 20 of 20 round trips, every leave `ok`, depth held at 1 throughout, `--strict` clean |
+| `reader-soak` | Turns, a chapter jump, Home and Library returns, then sleep | A book with chapters |
+| `sleep-sync` | Six fast turns, then sleep | Nothing particular |
+
+### The terminal protocol
+
+A selftest scenario says which one it is, how far it has got, and how it
+ended, in four records with one rule each.
+
+- **Every record names its scenario, and all of them are checked.** The
+  announcement is `bench-selftest: scenario=X view=...`, printed once per
+  boot, and `--strict` fails if X is not the workflow the capture was taken
+  as. The same comparison runs on the terminal and invalid records, because
+  the announcement prints four seconds after boot while a finite scenario
+  works for minutes: a capture attached late sees a terminal record and no
+  announcement, and a `page-turn` image captured as `storage-cache` supplies
+  storage telemetry from opening its book. The check matters most for
+  `reader-soak`, whose gate asks for input and render telemetry plus a
+  completed sleep and a later wake: a `sleep-sync` image produces every one
+  of those, and a successful sleeping scenario writes no terminal record, so
+  nothing else would notice. For a `thermal-run`, the comparison is against
+  the workflow it selected rather than `thermal-run` itself.
+
+- **It reports each operation once every postcondition has been checked**:
+  `bench-selftest: scenario=X completed=<kind> count=N`, where the kind is
+  `page_turn` or `folder_leave`. A checkpoint may stop a selftest capture
+  only when its kind is the one the capture is counting. The operation's own
+  telemetry, a paired render or a `folder_leave`, arrives before the
+  firmware's verdict: a turn still has its quiet check ahead, and a leave
+  its depth wait and quiet check, either of which can write an `invalid=` or
+  turn the run into `leave-failed`. A host that stopped on the telemetry
+  left that verdict unsent and certified the capture. The kind matters
+  because every scenario that opens a book turns pages first: an untyped
+  checkpoint made `sleep-sync --cycles 3` stop on its third page turn, in
+  the first boot, before a single sleep. On the device with typed
+  checkpoints: page-turn `--turns 50` stopped on `completed=page_turn
+  count=50`, one line after the checkpoint, no `invalid=`; folder-nav
+  `--entries 20` stopped on `completed=folder_leave count=20`; sleep-sync
+  `--cycles 3` saw eighteen page-turn checkpoints across its three boots and
+  stopped on the third `sleep_complete`, as before the checkpoints existed.
+
+  Checkpoints count from where the capture joined. The announcement is one
+  line at boot and a scenario works for minutes after it, so a capture that
+  attaches late sees no announcement. It still knows the stream is
+  self-driven, because an injected press logs `action=`, which a hand on the
+  buttons cannot produce, and the press comes before the operation it
+  drives. A late attach owes N operations from the point it joined rather
+  than stopping on a total it did not watch, and the first checkpoint it
+  sees is the baseline rather than a sample: the operation that checkpoint
+  certifies may have begun before the port was open. Only a capture that saw
+  the announcement counts its first checkpoint. On the device, attaching to
+  a folder-nav image 45 s after flashing and asking for `--entries 5` saw
+  checkpoints 4 through 9, counted five, and passed `--strict`; without the
+  baseline rule it stopped one checkpoint early and strict reported four of
+  five round trips captured. The report judges a self-driven capture on two
+  counts, and it owes both. The checkpoints, from the same baseline, say the
+  device completed N operations: a late attach one checkpoint short of its
+  target that ran on to `result=done` used to pass strict, because the
+  shortfall check counted `folder_leave` telemetry and that population held
+  the partial round trip the stop rule had excluded. The telemetry inside
+  the counted window, after the baseline, says the host measured N of them:
+  a checkpoint survives a dropped render line, and fifty completed turns
+  over forty-nine paired renders is reported as forty-nine measured, not
+  certified as fifty. A folder round trip is measured only with both halves
+  present, a successful `folder_enter` and the successful `folder_leave`
+  that follows it: enter and leave feed separate budgets, so five leaves
+  over four enters is four round trips, and the warning names both counts.
+  A manual capture carries no checkpoint and the host counts its round
+  trips the same way, with the parent-render boundary for folder leaves.
+
+- **One terminal record per run**, written by the driver rather than
+  the scenario, so a second one cannot happen: `bench-selftest: scenario=X
+  result=W`. `result=done` means the scenario finished everything it set out
+  to do. Any other word names what stopped it (`nav-failed`, `no-folders`,
+  `short-turns`, `lost-library`, `sleep-refused`). The host stops the capture
+  on any of them, because the device has stopped talking, and `--strict`
+  certifies only `done`.
+- **A phase that did not run** reports `bench-selftest: scenario=X
+  invalid=REASON` the moment it happens, and the scenario carries on.
+  Reported at the moment and not summarized at the end, because a count
+  target can stop the capture mid-scenario: `folder-nav --entries 20` ends on
+  the twentieth completed round trip, so a stall summarized after the walk
+  goes to a host that has stopped listening.
+
+The first device capture of this suite (2026-09-09, X3, a card with two
+folders of 6 and 14 rows) measured entry at 37-38 ms into the 6-row folder
+and 86-87 ms into the 14-row one, with leave at 38-40 ms throughout. Those
+populations size the `[folder-nav]` budgets in `benches.toml`.
+
+The entry gap between those two folders was settled by counting rather than
+timing. A bench build reports `bench: folder_walks walks= resolve_entries=
+iterate_entries=` after every folder operation: how many directory walks it
+took, how many parent entries were scanned resolving the path, and how many
+entries were iterated inside the folder. Measured on the same card:
+
+| operation | rows shown | walks | resolve entries | iterate entries | ms |
+|---|---|---|---|---|---|
+| enter, 6 books + 1 empty folder | 7 | 3 | 23 | 45 | 49 to 51 |
+| enter, 13 books + 1 folder | 14 | 3 | 17 | 96 | 86 to 109 |
+| leave, into a 2-row parent | 2 | 4 | 12 | 23 | 40 to 41 |
+
+Two things fall out. Path resolution is cheaper for the slow folder, so where
+it sits in `/BOOKS` is not the cause. And the slow folder iterates 32
+directory entries per walk to show 14 rows, while the fast one iterates 15 to
+show 7: both hold about one hidden entry per visible row, and the slow one
+has 17 more of them per walk, three walks over. A model of about 6 ms per
+walk plus 0.73 ms per iterated entry fits both entries, and predicts the
+leave at 40 ms with nothing left to tune.
+
+The hidden entries are filtered by `is_hidden_entry` before they reach the
+listing, so they cost iteration and show nothing. On a card organized from a
+Mac they are most likely AppleDouble `._` sidecars and `.DS_Store`, which is
+the population #65 stopped cataloguing as books; `ls -la` on the folder
+confirms it. Name length is a second-order cost on top: an LFN entry is one
+slot per 13 characters, and the fast folder has the longer names and is still
+faster because it has half the entries.
+
+**Build the image you flash, alone.** `tools/check.sh all` builds `fw` for
+both boards into the same `target/.../release/fw`, so a check running in the
+background while you flash hands espflash whichever board it wrote last. An
+X4 image on the X3 halts in the board guard with `board: halted` and a
+capture full of nothing. Check the ELF before it goes near the port: a bench
+build contains the string `folder_walks`, an X3 build contains `x3 init done`.
+
+`folder-nav` counts round trips rather than entries, because entering and
+leaving are separate storage operations with separate telemetry and the suite
+promises both. `--entries N` therefore owes N completed leaves, a capture
+holding entries and no leaves fails as a walk that went down and did not come
+back, and a refused leave fails as a card fault rather than counting as a
+sample.
+
+The Nth leave does not end the capture by itself. `folder_leave` is printed
+by the storage call the moment its SD work is done, before the listing has
+reached the app, been folded into state, or been drawn, so stopping there
+would end the run mid-round-trip on the very sample the operator asked for.
+The capture waits for the repaint that completes it, on the same principle as
+the page-turn prestage.
+
+Two boundaries, and telling them apart matters for anything driving the
+device. A press is answered by a render of the state that press produced. A
+storage operation is answered later, by its own event. Back inside a folder
+sets the browse to Leaving and touches the depth not at all, so a leave has
+to be waited for on the depth, not on the settle. Pressing Back again while
+that move is in flight is a deliberate escape hatch in the reducer: it
+abandons the move and leaves for Home. `--strict` fails on it too,
+  but the rest of the capture survives, which matters for a soak whose sleep
+  and wake are still worth having.
+
+Both matter because a suite's own strict signals are weaker than they look.
+reader-soak asks for input and render telemetry plus a completed sleep and a
+later wake, and a pass that skipped its chapter jump, its Home and Library
+return, or half its page turns produces all of that. So every advertised
+phase reports itself rather than relying on the suite gate to notice.
+
+The two sleep suites reach no terminal record on success, deliberately: the
+sleep does not return, and their capture is meant to continue across the wake
+into the next cycle. A terminal record from one of them means the sleep was
+refused.
+
+### The sleep suites reboot
+
+Deep sleep is terminal on this firmware: waking is a fresh boot. So
+`sleep-sync` and `reader-soak` do one cycle per boot, and the scenario runs
+again on the other side. bench.py reconnects across the re-enumeration and
+counts `sleep_complete` until it has the cycles it asked for.
+
+The wake comes from an RTC timer armed beside the button, which
+`bench-selftest` adds to `hal_ext::rtc`. It is off in every shipped build,
+and it needs to be: a reader that wakes itself would spend the battery this
+firmware is careful with.
+
+**A wake's own boot marker is unobservable, so read the waveform instead.**
+`main: deep_sleep_wake=` prints before `esp_rtos::start`, which is before the
+USB device re-enumerates, so on exactly the boots where it matters the host
+misses the line. bench.py then falls back to "a sleep preceded this, so call
+it a wake", which is a label rather than evidence. To confirm a wake really
+took the fast path, count Full refreshes: a wake with a settled sleep image
+owes none, so three boots with three Fulls means three cold paths whatever
+the labels say. Measured on the X3, that mislabelling was worth about 860 ms
+of wake timing before the timer wake was recognized.
+
+**A sleeping device cannot be reached at all.** Deep sleep powers down the
+USB Serial/JTAG peripheral, so the port disappears from the host and neither
+espflash nor bench.py can do anything until someone presses Power. A plain
+build left idle will do this on its own after 3 minutes in menus or 10 in
+Reading. Flash the bench build before walking away, or expect to press the
+button once.
+
 - Run longer hardware checks before releases or risky merges:
 
 ```sh

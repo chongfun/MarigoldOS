@@ -265,6 +265,10 @@ pub async fn run() {
                         state = state.apply_chapter_cursor(cursor);
                     }
                     rendering = false;
+                    // Below the render lock, so a scenario waiting on this
+                    // sees the same instant the app calls the cycle over.
+                    #[cfg(feature = "bench-selftest")]
+                    crate::bench_selftest::note_settled();
                     // The panel took a frame, so a later failure is a fresh one
                     // and gets its own retry.
                     repaint_retry.settled();
@@ -881,6 +885,20 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
     // the display task is mid-flush, mid-prestage, or inside a storage or
     // background-build step waits for all of it, and a press arriving during
     // that wait would be credited to a frame frozen before it existed.
+    // Publishing here and not after apply_input is the difference between
+    // seeing the app's state and seeing only the presses. A Library pick is
+    // answered by the card, so the move to Reading arrives as a storage
+    // event and never touches the input arm: a scenario watching the input
+    // side would still read "library" after the book opened, and press
+    // Confirm into a hold that Library keeps while a pick is in flight.
+    #[cfg(feature = "bench-selftest")]
+    crate::bench_selftest::publish_view(
+        state.view,
+        state.orientation,
+        state.front_buttons == app_core::FrontButtons::PagesLeft,
+        state.library_depth,
+        state.page,
+    );
     let mut request = state.render_request(kind);
     request.requested_at_ms = Instant::now().as_millis();
     DISPLAY_COMMANDS.send(DisplayCommand::Render(request)).await;

@@ -2569,6 +2569,546 @@ class StorageOpenPopulationTests(unittest.TestCase):
         )
         self.assertTrue(any("no warm storage_open events" in w for w in warnings), warnings)
 
+    # folder-nav budgets. Sized from the first device capture of the suite
+    # (2026-09-09, X3, 20 unattended round trips: enter 37-87 ms, leave
+    # 38-40 ms), so the fixtures below use those populations.
+    FOLDER_BUDGETS: ClassVar[dict[str, dict[str, int]]] = {
+        "folder-nav": {"folder_enter_warn_ms": 200, "folder_leave_warn_ms": 150}
+    }
+    FOLDER_START: ClassVar[dict[str, str]] = {
+        "suite": "folder-nav",
+        "workflow": "folder-nav",
+        "event": "run_start",
+    }
+
+    def test_a_measured_folder_walk_passes_both_budgets(self) -> None:
+        events = [self.FOLDER_START] + [
+            {"event": "folder_enter", "rows": 14, "depth": 1, "ok": True, "ms": 87},
+            {"event": "folder_leave", "rows": 20, "depth": 0, "ok": True, "ms": 39},
+        ] * 5
+        self.assertEqual(bench.evaluate_budgets(events, self.FOLDER_BUDGETS), [])
+
+    def test_a_slow_folder_enter_fails_its_budget(self) -> None:
+        events = [
+            self.FOLDER_START,
+            {"event": "folder_enter", "rows": 14, "depth": 1, "ok": True, "ms": 900},
+            {"event": "folder_leave", "rows": 20, "depth": 0, "ok": True, "ms": 39},
+        ]
+        warnings = bench.evaluate_budgets(events, self.FOLDER_BUDGETS)
+        self.assertTrue(any("folder enter p95 900ms above" in w for w in warnings), warnings)
+        self.assertFalse(any("folder leave" in w for w in warnings), warnings)
+
+    # A selftest scenario ends its own capture with `result=done`, and the
+    # operator's --seconds is the ceiling the docs tell them to pass. Holding
+    # that run to the window failed every storage-cache selftest on "185s of
+    # the 500s requested" with `done` in the same log.
+    def _selftest_run(self, stop_reason: str, result: str) -> list[dict[str, object]]:
+        return [
+            {
+                "suite": "storage-cache",
+                "workflow": "storage-cache",
+                "event": "run_start",
+                "requested": {"seconds": 500},
+            },
+            {"event": "render", "view": "Reading", "t_ms": 1000},
+            {"event": "input", "button": "Next", "t_ms": 900},
+            {
+                "event": "selftest_done",
+                "scenario": "storage-cache",
+                "result": result,
+            },
+            {"event": "run_end", "stop_reason": stop_reason, "elapsed_s": 185.0},
+        ]
+
+    def test_a_scenario_that_finished_itself_owes_no_duration(self) -> None:
+        warnings = bench.evaluate_suite_signals(self._selftest_run("selftest", "done"))
+        self.assertFalse(any("of the 500s requested" in w for w in warnings), warnings)
+
+    def test_a_clock_stop_still_owes_the_duration(self) -> None:
+        """Same short elapsed, but the clock stopped it: the window was the
+        contract and it was not met."""
+        warnings = bench.evaluate_suite_signals(self._selftest_run("duration", "done"))
+        self.assertTrue(any("of the 500s requested" in w for w in warnings), warnings)
+
+    def test_a_scenario_that_ended_without_done_earns_no_exemption(self) -> None:
+        warnings = bench.evaluate_suite_signals(self._selftest_run("selftest", "nav-failed"))
+        self.assertTrue(any("of the 500s requested" in w for w in warnings), warnings)
+        self.assertTrue(any("rather than done" in w for w in warnings), warnings)
+
+    # The last folder leave's repaint. The Back press renders at once, before
+    # storage answers, and the SD leave prints in about 40 ms, so the first
+    # render to settle after `folder_leave` is usually that older Back render.
+    @staticmethod
+    def _capture(
+        lines: list[str], target: int, timeout_s: float = 60.0
+    ) -> tuple[dict[str, int], list[dict[str, object]]]:
+        import io
+        import json
+
+        out = io.StringIO()
+        counts = bench.process_capture_stream(
+            (line + "\n" for line in lines),
+            "folder-nav",
+            ("folder_leave", target),
+            out=out,
+            print_lines=False,
+            # Generous by default so the ordering, not the clock, decides.
+            pending_prestage_timeout_s=timeout_s,
+        )
+        return counts, [json.loads(line) for line in out.getvalue().splitlines()]
+
+    ENTER = "bench: folder_enter rows=10 books=4 depth=1 ms=41 t_ms=1000"
+    BACK = "bench: input button=Some(Back) aux=2000 nav=0 page_raw=0 t_ms=1400"
+    LEAVE = "bench: folder_leave rows=17 depth=0 ok=true ms=38 t_ms=1450"
+    # Requested at the press, before the leave; settles after it.
+    BACK_RENDER = (
+        "bench: render view=Library mode=Fast page=0 chapter=0 layout_ms=5 flush_ms=405 "
+        "req_ms=1401 deq_ms=1402 t_ms=1810"
+    )
+    # The parent listing, requested once storage answered.
+    PARENT_RENDER = (
+        "bench: render view=Library mode=Fast page=0 chapter=0 layout_ms=5 flush_ms=405 "
+        "req_ms=1830 deq_ms=1831 t_ms=2240"
+    )
+
+    START = "bench-selftest: scenario=folder-nav view=home"
+    COMPLETED = "bench-selftest: scenario=folder-nav completed=folder_leave count=1"
+    INVALID_QUIET = "bench-selftest: scenario=folder-nav invalid=not-quiescent"
+    LEAVE_FAILED = "bench-selftest: scenario=folder-nav result=leave-failed"
+
+    def test_a_selftest_keeps_the_verdict_that_follows_the_qualifying_render(self) -> None:
+        """The parent render satisfies the manual boundary but precedes the
+        firmware's quiet check on the leave. A selftest capture must run on
+        through that verdict, here a failure, and --strict must see it."""
+        counts, events = self._capture(
+            [
+                self.START,
+                self.ENTER,
+                self.BACK,
+                self.LEAVE,
+                self.BACK_RENDER,
+                self.PARENT_RENDER,
+                self.INVALID_QUIET,
+                self.LEAVE_FAILED,
+            ],
+            1,
+        )
+        kinds = [e.get("event") for e in events]
+        self.assertIn("selftest_invalid", kinds)
+        self.assertIn("selftest_done", kinds)
+        reason = bench.observed_stop_reason(counts, ("folder_leave", 1), None)
+        self.assertEqual(reason, "selftest")
+        run = [{"suite": "folder-nav", "workflow": "folder-nav", "event": "run_start"}] + events
+        warnings = bench.evaluate_suite_signals(run)
+        self.assertTrue(any("not-quiescent" in w for w in warnings), warnings)
+        self.assertTrue(any("result=leave-failed" in w for w in warnings), warnings)
+
+    def test_a_selftest_stops_on_its_checkpoint_not_on_telemetry(self) -> None:
+        counts, events = self._capture(
+            [
+                self.START,
+                self.ENTER,
+                self.BACK,
+                self.LEAVE,
+                self.BACK_RENDER,
+                self.PARENT_RENDER,
+                self.COMPLETED,
+                "bench: folder_enter rows=1 books=0 depth=1 ms=40 t_ms=9000",
+            ],
+            1,
+        )
+        # Stopped at the checkpoint: the later line never entered the capture.
+        self.assertFalse(any(e.get("t_ms") == 9000 for e in events))
+        self.assertEqual(bench.observed_stop_reason(counts, ("folder_leave", 1), None), "count")
+
+    def test_a_selftest_page_turn_keeps_the_last_quiet_verdict(self) -> None:
+        """The 2nd pairing and its prestage reach the host before the quiet
+        check on that turn has run; the invalid it writes must be captured,
+        and the capture stops on the checkpoint that follows it. The firmware
+        checkpoints after every turn, so the fixture does too."""
+        import io
+        import json
+
+        lines = ["bench-selftest: scenario=page-turn view=home"]
+        t = 1000
+        for i in range(1, 3):
+            lines.append(
+                f"bench: input button=Some(Next) action=Next aux=2000 nav=0 page_raw=0 t_ms={t}"
+            )
+            lines.append(
+                f"bench: render view=Reading mode=Fast page={i} chapter=0 layout_ms=1 "
+                f"flush_ms=405 prestage_ms=24 req_ms={t + 2} deq_ms={t + 3} t_ms={t + 430}"
+            )
+            lines.append(f"bench: prestage staged=true elapsed_ms=24 t_ms={t + 455}")
+            if i == 2:
+                lines.append("bench-selftest: scenario=page-turn invalid=not-quiescent")
+            lines.append(f"bench-selftest: scenario=page-turn completed=page_turn count={i}")
+            t += 2000
+        out = io.StringIO()
+        counts = bench.process_capture_stream(
+            (line + "\n" for line in lines),
+            "page-turn",
+            ("page_turn", 2),
+            out=out,
+            print_lines=False,
+        )
+        events = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertIn("selftest_invalid", [e.get("event") for e in events])
+        self.assertEqual(bench.observed_stop_reason(counts, ("page_turn", 2), None), "count")
+
+    def test_sleep_cycles_ignore_page_turn_checkpoints(self) -> None:
+        """sleep-sync turns six pages before each sleep. Those checkpoints must
+        not be read as sleep cycles: the run stops on the second completed
+        sleep, not the second page turn, and a checkpoint count that restarts
+        every boot must not stall a --cycles target it can never reach."""
+        import io
+
+        def boot(t: int) -> list[str]:
+            lines = ["bench-selftest: scenario=sleep-sync view=home"]
+            for i in range(1, 7):
+                lines.append(
+                    "bench: input button=Some(Next) action=Next aux=2000 nav=0 page_raw=0 "
+                    f"t_ms={t + i * 500}"
+                )
+                lines.append(f"bench-selftest: scenario=sleep-sync completed=page_turn count={i}")
+            # The one line the harness counts as a finished cycle.
+            lines.append(f"bench: sleep phase=complete ok=true t_ms={t + 4000}")
+            return lines
+
+        lines = boot(1000) + boot(20000) + boot(40000)
+        out = io.StringIO()
+        counts = bench.process_capture_stream(
+            (line + "\n" for line in lines),
+            "sleep-sync",
+            ("sleep_complete", 2),
+            out=out,
+            print_lines=False,
+        )
+        self.assertEqual(counts.get("sleep_complete"), 2)
+        self.assertEqual(bench.observed_stop_reason(counts, ("sleep_complete", 2), None), "count")
+
+    def test_a_page_turn_checkpoint_does_not_satisfy_a_folder_target(self) -> None:
+        counts, _ = self._capture(
+            [
+                self.START,
+                self.ENTER,
+                self.BACK,
+                self.LEAVE,
+                self.BACK_RENDER,
+                self.PARENT_RENDER,
+                "bench-selftest: scenario=folder-nav completed=page_turn count=5",
+            ],
+            1,
+        )
+        self.assertNotEqual(bench.observed_stop_reason(counts, ("folder_leave", 1), None), "count")
+
+    def test_a_late_attach_is_still_self_driven(self) -> None:
+        """No banner: the capture joined after boot. The injected press carries
+        action=, which a hand cannot produce, so the stream is self-driven and
+        the count waits for the checkpoint, keeping the verdict that follows
+        the qualifying render. Without the announce the first checkpoint seen
+        is only the baseline: the round trip it certifies may have begun
+        before the capture opened, so the target is owed from the next one."""
+        round_trip = [
+            "bench: input button=Some(Confirm) action=Confirm aux=2000 nav=0 page_raw=0 t_ms=1300",
+            self.ENTER,
+            self.BACK,
+            self.LEAVE,
+            self.BACK_RENDER,
+            self.PARENT_RENDER,
+        ]
+        # joined mid-scenario: this is the scenario's 8th round trip
+        lines = [
+            *round_trip,
+            self.INVALID_QUIET,
+            "bench-selftest: scenario=folder-nav completed=folder_leave count=8",
+        ]
+        counts, events = self._capture(lines, 1)
+        self.assertIn("selftest_invalid", [e.get("event") for e in events])
+        self.assertEqual(counts.get("selftest_completed:folder_leave", 0), 0)
+        self.assertNotEqual(bench.observed_stop_reason(counts, ("folder_leave", 1), None), "count")
+        counts, _ = self._capture(
+            [
+                *lines,
+                *round_trip,
+                "bench-selftest: scenario=folder-nav completed=folder_leave count=9",
+            ],
+            1,
+        )
+        self.assertEqual(counts.get("selftest_completed:folder_leave", 0), 1)
+        self.assertEqual(bench.observed_stop_reason(counts, ("folder_leave", 1), None), "count")
+
+    @classmethod
+    def _late_attach_run(cls, full_round_trips: int, requested: int) -> list:
+        """A folder-nav selftest joined during its 16th round trip.
+
+        The stream opens on that round trip's `folder_leave` and checkpoint,
+        then carries `full_round_trips` whole ones, then the scenario's own
+        `result=done`, as a finite scenario that outran the target would.
+        """
+        events = [
+            {
+                "event": "run_start",
+                "suite": "folder-nav",
+                "workflow": "folder-nav",
+                "host_time": 1.0,
+                "requested": {"folder_entries": requested},
+            }
+        ]
+        round_trip = [
+            "bench: input button=Some(Confirm) action=Confirm aux=2000 nav=0 page_raw=0 t_ms=1300",
+            cls.ENTER,
+            "bench: input button=Some(Back) action=Back aux=2000 nav=0 page_raw=0 t_ms=1400",
+            cls.LEAVE,
+            cls.BACK_RENDER,
+            cls.PARENT_RENDER,
+        ]
+        lines = [cls.LEAVE, "bench-selftest: scenario=folder-nav completed=folder_leave count=16"]
+        for index in range(full_round_trips):
+            lines.extend(round_trip)
+            lines.append(
+                f"bench-selftest: scenario=folder-nav completed=folder_leave count={17 + index}"
+            )
+        lines.append("bench-selftest: scenario=folder-nav result=done")
+        for line in lines:
+            events.extend(bench.parse_line(line, "folder-nav"))
+        events.append(
+            {"event": "run_end", "elapsed_s": 90.0, "stop_reason": "selftest", "completed": True}
+        )
+        return events
+
+    def test_a_late_attach_is_judged_on_the_round_trips_it_watched_whole(self) -> None:
+        """The stop counts from the baseline; so must the report.
+
+        Four whole round trips after the baseline, then `result=done`: the
+        count stop is not reached, the scenario ends the capture, and five
+        `folder_leave` records sit in the log. The report must not count the
+        partial one the stop rule excluded.
+        """
+        warnings = bench.evaluate_suite_signals(self._late_attach_run(4, 5))
+        self.assertEqual(
+            [w for w in warnings if "round trips" in w],
+            [
+                (
+                    "folder-nav: 4 of 5 requested folder round trips captured; "
+                    "the run is short of the sample count it was asked for"
+                )
+            ],
+        )
+        self.assertEqual(
+            [
+                w
+                for w in bench.evaluate_suite_signals(self._late_attach_run(5, 5))
+                if "round trips" in w
+            ],
+            [],
+        )
+
+    def test_a_checkpoint_does_not_stand_in_for_a_missing_measurement(self) -> None:
+        """Five counted checkpoints over four measurable round trips.
+
+        The device did complete the fifth round trip, so the checkpoint is
+        real, but its `folder_leave` line is gone from the stream and the
+        statistics would be drawn from four. Both counts are owed.
+        """
+        events = self._late_attach_run(5, 5)
+        leaves = [i for i, e in enumerate(events) if e.get("event") == "folder_leave"]
+        del events[leaves[-1]]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertEqual(
+            [w for w in warnings if "round trips" in w],
+            [
+                (
+                    "folder-nav: the device completed 5 folder round trips but only "
+                    "4 of the 5 requested were measured (5 entries and 4 leaves); the "
+                    "telemetry for the rest is missing from the capture"
+                )
+            ],
+        )
+
+    def test_a_round_trip_without_its_enter_is_not_measured(self) -> None:
+        """The mirror: five checkpoints, five leaves, one `folder_enter` gone.
+
+        Enter and leave feed separate budgets. Counting leaves alone would
+        call this five measured round trips with four enter samples.
+        """
+        events = self._late_attach_run(5, 5)
+        enters = [i for i, e in enumerate(events) if e.get("event") == "folder_enter"]
+        del events[enters[-1]]
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertEqual(
+            [w for w in warnings if "round trips" in w],
+            [
+                (
+                    "folder-nav: the device completed 5 folder round trips but only "
+                    "4 of the 5 requested were measured (4 entries and 5 leaves); the "
+                    "telemetry for the rest is missing from the capture"
+                )
+            ],
+        )
+
+    def test_a_manual_round_trip_is_also_both_halves(self) -> None:
+        events = [
+            {
+                "event": "run_start",
+                "suite": "folder-nav",
+                "workflow": "folder-nav",
+                "host_time": 1.0,
+                "requested": {"folder_entries": 5},
+            }
+        ]
+        for index in range(5):
+            lines = [self.ENTER, self.BACK, self.LEAVE, self.BACK_RENDER, self.PARENT_RENDER]
+            if index == 2:
+                lines.remove(self.ENTER)
+            for line in lines:
+                events.extend(bench.parse_line(line, "folder-nav"))
+        events.append(
+            {"event": "run_end", "elapsed_s": 90.0, "stop_reason": "count", "completed": True}
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertEqual(
+            [w for w in warnings if "round trips" in w],
+            [
+                (
+                    "folder-nav: 4 of 5 requested folder round trips captured (4 entries "
+                    "and 5 leaves); the run is short of the sample count it was asked for"
+                )
+            ],
+        )
+
+    def test_a_page_turn_checkpoint_does_not_stand_in_for_a_missing_render(self) -> None:
+        """Fifty turns completed, forty-nine paired renders in the log."""
+        events = [
+            {
+                "event": "run_start",
+                "suite": "page-turn",
+                "workflow": "page-turn",
+                "host_time": 1.0,
+                "requested": {"page_turns": 50},
+            }
+        ]
+        events.extend(bench.parse_line("bench-selftest: scenario=page-turn view=home", "page-turn"))
+        for index in range(50):
+            press = 1000 + index * 3000
+            events.extend(
+                bench.parse_line(
+                    "bench: input button=Some(Next) action=Next aux=2000 nav=0 page_raw=0 "
+                    f"t_ms={press}",
+                    "page-turn",
+                )
+            )
+            if index != 0:
+                events.extend(
+                    bench.parse_line(
+                        "bench: render view=Reading mode=Fast page=1 chapter=0 layout_ms=5 "
+                        f"flush_ms=405 req_ms={press} deq_ms={press + 1} t_ms={press + 470}",
+                        "page-turn",
+                    )
+                )
+            events.extend(
+                bench.parse_line(
+                    f"bench-selftest: scenario=page-turn completed=page_turn count={index + 1}",
+                    "page-turn",
+                )
+            )
+        events.append(
+            {"event": "run_end", "elapsed_s": 160.0, "stop_reason": "count", "completed": True}
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertIn(
+            "page-turn: the device completed 50 page turns but only 49 of the 50 requested "
+            "were measured; the telemetry for the rest is missing from the capture",
+            warnings,
+        )
+
+    def test_a_manual_capture_is_still_judged_on_its_telemetry(self) -> None:
+        """No selftest record and no `action=`: five leaves are five round trips."""
+        events = [
+            {
+                "event": "run_start",
+                "suite": "folder-nav",
+                "workflow": "folder-nav",
+                "host_time": 1.0,
+                "requested": {"folder_entries": 5},
+            }
+        ]
+        for _ in range(5):
+            for line in (self.ENTER, self.BACK, self.LEAVE, self.BACK_RENDER, self.PARENT_RENDER):
+                events.extend(bench.parse_line(line, "folder-nav"))
+        events.append(
+            {"event": "run_end", "elapsed_s": 90.0, "stop_reason": "count", "completed": True}
+        )
+        warnings = bench.evaluate_suite_signals(events)
+        self.assertEqual([w for w in warnings if "round trips" in w], [])
+
+    def test_the_back_render_does_not_complete_the_last_leave(self) -> None:
+        # Stream ends after the Back render: the wait is still open, so the
+        # run must not read as complete.
+        counts, _ = self._capture([self.ENTER, self.BACK, self.LEAVE, self.BACK_RENDER], 1)
+        reason = bench.observed_stop_reason(counts, ("folder_leave", 1), None)
+        self.assertEqual(reason, "leave-unrendered")
+        self.assertNotIn(reason, bench.COMPLETED_STOP_REASONS)
+
+    def test_a_leave_whose_repaint_never_comes_is_not_complete(self) -> None:
+        """The clock path: the deadline passes with only noise after the leave."""
+        counts, _ = self._capture(
+            [
+                self.ENTER,
+                self.BACK,
+                self.LEAVE,
+                self.BACK_RENDER,
+                "sd: session exit",
+                "sd: session exit",
+            ],
+            1,
+            timeout_s=0.0,
+        )
+        reason = bench.observed_stop_reason(counts, ("folder_leave", 1), None)
+        self.assertEqual(reason, "leave-unrendered")
+
+    def test_the_parent_render_completes_a_manual_capture(self) -> None:
+        """No selftest_start: an operator's capture has no checkpoint, so the
+        parent render is the best available boundary."""
+        counts, events = self._capture(
+            [self.ENTER, self.BACK, self.LEAVE, self.BACK_RENDER, self.PARENT_RENDER], 1
+        )
+        reason = bench.observed_stop_reason(counts, ("folder_leave", 1), None)
+        self.assertEqual(reason, "count")
+        # And the capture kept the render that completed it.
+        self.assertEqual(sum(1 for e in events if e.get("event") == "render"), 2)
+
+    def test_a_press_is_read_by_its_action_when_it_carries_one(self) -> None:
+        # Injected under PagesLeft: the key that turns a page is Confirm.
+        swapped = bench.parse_line(
+            "bench: input button=Some(Confirm) action=Next aux=2000 nav=0 page_raw=0 t_ms=5",
+            "page-turn",
+        )[0]
+        manual_next = bench.parse_line(
+            "bench: input button=Some(Next) aux=2000 nav=0 page_raw=0 t_ms=6", "page-turn"
+        )[0]
+        manual_confirm = bench.parse_line(
+            "bench: input button=Some(Confirm) aux=2000 nav=0 page_raw=0 t_ms=7", "page-turn"
+        )[0]
+        self.assertEqual(swapped.get("button"), "Confirm")
+        self.assertIn("page_input", bench.event_counters(swapped))
+        self.assertIn("page_input", bench.event_counters(manual_next))
+        self.assertNotIn("page_input", bench.event_counters(manual_confirm))
+
+    def test_a_refused_leave_is_not_a_sample_for_the_leave_budget(self) -> None:
+        """A refused leave returns fast and is a card fault the suite check
+        names on its own; letting it into the percentile would measure how
+        quickly the card said no. With only the refusal present, the budget
+        covered no sample and fails closed."""
+        events = [
+            self.FOLDER_START,
+            {"event": "folder_enter", "rows": 14, "depth": 1, "ok": True, "ms": 87},
+            {"event": "folder_leave", "rows": 20, "depth": 1, "ok": False, "ms": 2},
+        ]
+        warnings = bench.evaluate_budgets(events, self.FOLDER_BUDGETS)
+        self.assertTrue(any("no folder_leave events" in w for w in warnings), warnings)
+        self.assertFalse(any("folder leave p95" in w for w in warnings), warnings)
+
     @patch("builtins.print")
     def test_the_report_prints_one_line_per_path(self, mock_print) -> None:
         with tempfile.TemporaryDirectory() as tmp:
