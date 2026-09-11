@@ -298,12 +298,19 @@ card, none yet assigned an item.
   or four walks, and each walk re-resolves the path from the root. About
   10 ms per walk, on a fast card, for a folder of seven rows. That is the
   item below, and it is where the entry cost actually lives.
-- **A mixed folder is walked three times per entry.** Resolving entries and
-  iterating them are separate walks and a folder holding both books and
-  subfolders paid a third. Each walk re-resolves the path from the root
-  (`resolve_entries`), so path resolution is repeated per walk. Collapsing
-  to one walk per entry is the obvious item; size it against the 41 ms +
-  0.356 ms/row model in `docs/ARCHITECTURE.md` before writing it.
+- **A mixed folder is walked three times per entry. FIXED in PR #94
+  (2026-09-10).** Counting the rows and filling the page each opened the
+  shelf and walked every path component again, and paging resolved once
+  more per region; leaving re-resolved the parent for every window of the
+  walk that finds the folder it came from. `open_listing` now resolves once
+  and holds the handles, which the driver allows because `open_dir` returns
+  a directory borrowing the volume manager rather than its parent.
+  Measured on the X3, three paired captures each way, 60 round trips per
+  arm: folder enter 28.8 to 25.8 ms mean, leave 17.7 to 14.7 ms, neither
+  range overlapping. Walks per round trip 3 to 1 and 4 to 2; entries
+  scanned while resolving 19 to 7 and 13 to 5. A 14-row folder and a 7-row
+  one now enter in the same 26 ms. One resolution remains on the leave
+  path, which is where the residual 2 of the 4 walks sits.
 - **One 639 ms warm book open after a folder descent.** Recorded 2026-09-09
   in a storage-cache capture whose walk went through the folder tree to
   reach a book; every other warm open in that capture and the four since
