@@ -1463,6 +1463,92 @@ fn a_post_scan_relist_either_lists_or_reports_it_could_not() {
 /// The relist retires every row number picked before it, whether or not the
 /// catalog moved. A scan whose recovery is unfinished rebuilds nothing, so
 /// the catalog epoch stands, and browsing goes back to the root anyway: a row
+/// A page the card would not read leaves no rows behind.
+///
+/// `ensure_page` runs before every Library paint and slides the resident
+/// page over the rows about to be drawn. It is best-effort by contract: a
+/// card that stalls costs that paint its rows. What it must not do is keep
+/// serving the page the reader has just scrolled off, so both ways of
+/// failing, the folder that would not open and the page that would not
+/// read, have to leave the same nothing behind.
+///
+/// Both ways end in the same empty page, so the sweep alone cannot say
+/// which one it exercised, and a later change that made resolution cost
+/// more reads could leave it testing only the open. Each probe is therefore
+/// run twice on two freshly built cards, once through `open_listing` alone
+/// to learn whether that probe faults the opening, and once through
+/// `ensure_page`. A fresh card per run makes the read sequence after the
+/// arming point identical between the two, so the first run is an oracle
+/// for the second, and the count below is of failures proven to be inside
+/// the paging.
+#[test]
+fn a_page_that_would_not_read_leaves_no_rows_behind() {
+    /// Build a card, enter the seeded folder, and hand the caller the disk,
+    /// the card root, the store and the last row number.
+    fn in_the_folder(f: impl FnOnce(&SharedDisk, &Dir<'_>, Box<ReaderStore>, u16)) {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        seed_shelf(&root, 40);
+        let mut store = Box::new(ReaderStore::new());
+        reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+        let folder = store.browse().count() - 1;
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut store, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+        let far = store.browse().count() - 1;
+        f(&disk, &root, store, far);
+    }
+
+    let mut page_failures = 0usize;
+    let mut open_failures = 0usize;
+    for probe in 0..48 {
+        // The oracle: with this probe armed, does the opening survive?
+        let mut opened = false;
+        in_the_folder(|disk, root, store, _| {
+            let path = store.browse().path().clone();
+            disk.fault.fail_read_in.set(Some(probe));
+            opened = matches!(
+                upload_store::library::open_listing(root, &path),
+                Ok(Some(_))
+            );
+            disk.fault.fail_read_in.set(None);
+        });
+
+        in_the_folder(|disk, root, mut store, far| {
+            assert!(
+                store.folder_row(0).is_some(),
+                "the folder came with its first page",
+            );
+            disk.fault.fail_read_in.set(Some(probe));
+            let touched = reader_cache::browse::ensure_page(&mut store, root, far, true);
+            disk.fault.fail_read_in.set(None);
+            if !touched || store.folder_row(far as usize).is_some() {
+                // Either no read was owed, or the read got through despite
+                // the armed fault. Neither is this test's case.
+                return;
+            }
+            if opened {
+                page_failures += 1;
+            } else {
+                open_failures += 1;
+            }
+            assert_eq!(
+                store.folder_rows().len(),
+                0,
+                "a page the card would not read leaves the resident page \
+                 empty, not holding the rows the reader scrolled away from",
+            );
+        });
+    }
+    assert!(
+        page_failures > 0,
+        "the sweep has to have failed at least one read inside the paging, \
+         not only inside the opening ({open_failures} of those)",
+    );
+}
+
 /// picked in the folder it left names a different child of a different place.
 #[test]
 fn a_relist_retires_the_rows_picked_before_it() {
