@@ -37,6 +37,29 @@ except ImportError:  # pragma: no cover - non-POSIX hosts cannot capture serial.
 DEFAULT_PORT = "/dev/cu.usbmodem101"
 DEFAULT_OUT = Path("target/bench/latest.jsonl")
 DEFAULT_BUDGETS = Path(__file__).with_name("benches.toml")
+DEFAULT_BUDGETS_X3 = Path(__file__).with_name("benches-x3.toml")
+BOARD_BUDGETS: dict[str, Path] = {
+    "x4": DEFAULT_BUDGETS,
+    "x3": DEFAULT_BUDGETS_X3,
+}
+
+
+def resolve_budgets_path(
+    budgets: Path | None,
+    board: str | None = None,
+    events: list[dict[str, Any]] | None = None,
+) -> Path:
+    if budgets is not None:
+        return budgets
+    if board and board in BOARD_BUDGETS:
+        return BOARD_BUDGETS[board]
+    if events:
+        for event in events:
+            b = event.get("board")
+            if b in BOARD_BUDGETS:
+                return BOARD_BUDGETS[b]
+    return DEFAULT_BUDGETS
+
 
 LEGACY_RENDER_RE = re.compile(
     r"bench: render (?P<view>\w+) (?P<mode>\w+) page=(?P<page>\d+) "
@@ -222,7 +245,18 @@ def main() -> int:
 
     report = sub.add_parser("report", help="summarize one or more bench JSONL logs")
     report.add_argument("paths", nargs="+", type=Path)
-    report.add_argument("--budgets", type=Path, default=DEFAULT_BUDGETS)
+    report.add_argument(
+        "--budgets",
+        type=Path,
+        default=None,
+        help="budgets TOML file to enforce (default: benches.toml)",
+    )
+    report.add_argument(
+        "--board",
+        choices=["x4", "x3"],
+        default=None,
+        help="board profile for budget selection (x3 selects benches-x3.toml)",
+    )
     report.add_argument("--strict", action="store_true", help="exit non-zero on budget warnings")
     report.add_argument(
         "--all",
@@ -273,6 +307,18 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     )
     p.add_argument("--espflash", default="espflash", help="espflash executable")
     p.add_argument("--strict", action="store_true", help="exit non-zero on budget warnings")
+    p.add_argument(
+        "--budgets",
+        type=Path,
+        default=None,
+        help="budgets TOML file to enforce (default: benches.toml)",
+    )
+    p.add_argument(
+        "--board",
+        choices=["x4", "x3"],
+        default=None,
+        help="board profile for budget selection (x3 selects benches-x3.toml)",
+    )
     p.add_argument("--note", action="append", default=[], help="free-form note stored in metadata")
     p.add_argument("--book", default=None, help="operator label for the book under test")
     if name == "page-turn":
@@ -562,6 +608,8 @@ def run_capture(args: argparse.Namespace) -> int:
         # carries a completion contract at all.
         "requested": requested,
     }
+    if getattr(args, "board", None):
+        metadata["board"] = args.board
     counts: dict[str, int] = {}
     command_started = time.monotonic()
     # Reassigned once the device is back and the port is readable: a reset and
@@ -621,9 +669,12 @@ def run_capture(args: argparse.Namespace) -> int:
                     "counts": counts,
                 },
             )
+    budgets_path = resolve_budgets_path(
+        getattr(args, "budgets", None), getattr(args, "board", None)
+    )
     report_warnings = summarize_paths(
         [args.out],
-        DEFAULT_BUDGETS,
+        budgets_path,
         validate_suites=args.strict,
     )
     return 1 if args.strict and report_warnings else 0
@@ -1084,9 +1135,24 @@ def write_event(out: Any, event: dict[str, Any]) -> None:
 
 
 def run_report(args: argparse.Namespace) -> int:
+    inferred_events = None
+    if (
+        getattr(args, "budgets", None) is None
+        and getattr(args, "board", None) is None
+        and args.paths
+    ):
+        try:
+            inferred_events = read_events(args.paths[0])
+        except Exception:
+            inferred_events = None
+    budgets_path = resolve_budgets_path(
+        getattr(args, "budgets", None),
+        getattr(args, "board", None),
+        inferred_events,
+    )
     report_warnings = summarize_paths(
         args.paths,
-        args.budgets,
+        budgets_path,
         validate_suites=args.strict,
         latest_only=not getattr(args, "all", False),
     )

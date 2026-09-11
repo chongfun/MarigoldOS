@@ -89,6 +89,14 @@ while the parser was optional `--strict` could silently check nothing, which
 is how a 16.7x budget overrun once passed clean. A budget file that cannot be
 read or parsed still fails `--strict` and warns a plain report.
 
+Warning budgets default to `tools/bench/benches.toml`, which accommodates both
+boards (including the X4's ~421 ms Fast waveform and ~470 ms press-to-settled).
+To enforce the tighter waveform and controller intervals of the X3 panel (such
+as the A12 CDI interval tuning, 307 ms Fast BUSY, 400 ms turn ceiling), pass
+`--board x3` or `--budgets tools/bench/benches-x3.toml`. When `--board x3` is used
+during capture, the board profile is recorded in metadata so subsequent
+`report` commands select `benches-x3.toml` automatically.
+
 The `page turn` statistic is guarded against operator cadence: the report
 prints a `page inputs:` line accounting for every press (`presses`,
 `page_turns`, `nav`, `coalesced`, `unmatched`, `reading_renders`), suppresses

@@ -295,7 +295,7 @@ class BudgetLoadingTests(unittest.TestCase):
         self.assertEqual(warnings, ["no events parsed"])
 
     def test_checked_in_budgets_have_no_dead_keys(self) -> None:
-        """Every key in benches.toml must be read somewhere in bench.py.
+        """Every key in checked-in budget files must be read somewhere in bench.py.
 
         Scans the TOML textually rather than parsing it, so this runs on the
         interpreter `tools/check.sh` actually invokes. Skipping here on 3.9
@@ -304,12 +304,17 @@ class BudgetLoadingTests(unittest.TestCase):
         stop. A dead key is a budget that reads as enforced and is not, which
         is worse than no budget at all.
         """
-        text = bench.DEFAULT_BUDGETS.read_text(encoding="utf-8")
         source = Path(bench.__file__).read_text(encoding="utf-8")
-        keys = re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", text, re.MULTILINE)
-        self.assertTrue(keys, "no budget keys found -- the scan itself is broken")
-        for key in keys:
-            self.assertIn(f'"{key}"', source, f"budget key {key} is read by nothing")
+        for budget_file in (bench.DEFAULT_BUDGETS, bench.DEFAULT_BUDGETS_X3):
+            text = budget_file.read_text(encoding="utf-8")
+            keys = re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", text, re.MULTILINE)
+            self.assertTrue(
+                keys, f"no budget keys found in {budget_file.name} -- the scan itself is broken"
+            )
+            for key in keys:
+                self.assertIn(
+                    f'"{key}"', source, f"budget key {key} in {budget_file.name} is read by nothing"
+                )
 
 
 class PageTurnTrustTests(unittest.TestCase):
@@ -3281,22 +3286,33 @@ class BudgetSchemaTests(unittest.TestCase):
         self.assertIn("unknown key typo_ms", message)
 
     def test_the_checked_in_budgets_satisfy_the_schema(self) -> None:
-        """The file this repo ships must load, or --strict fails everywhere."""
-        text = bench.DEFAULT_BUDGETS.read_text(encoding="utf-8")
-        section = None
-        for line in text.splitlines():
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            if line.startswith("["):
-                section = line.strip("[]")
-                self.assertIn(section, bench.BUDGET_SCHEMA, f"unknown section {section}")
-                continue
-            key, _, value = (part.strip() for part in line.partition("="))
-            self.assertIn(key, bench.BUDGET_SCHEMA[section], f"{key} is not in BUDGET_SCHEMA")
-            # No leading minus: a negative millisecond budget is a bound no
-            # measurement can cross, which is a gate that is silently off.
-            self.assertRegex(value, r"^\d+$", f"{key} is not a non-negative integer")
+        """The files this repo ships must load, or --strict fails everywhere."""
+        for budget_file in (bench.DEFAULT_BUDGETS, bench.DEFAULT_BUDGETS_X3):
+            text = budget_file.read_text(encoding="utf-8")
+            section = None
+            for line in text.splitlines():
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("["):
+                    section = line.strip("[]")
+                    self.assertIn(
+                        section,
+                        bench.BUDGET_SCHEMA,
+                        f"unknown section {section} in {budget_file.name}",
+                    )
+                    continue
+                key, _, value = (part.strip() for part in line.partition("="))
+                self.assertIn(
+                    key,
+                    bench.BUDGET_SCHEMA[section],
+                    f"{key} in {budget_file.name} is not in BUDGET_SCHEMA",
+                )
+                # No leading minus: a negative millisecond budget is a bound no
+                # measurement can cross, which is a gate that is silently off.
+                self.assertRegex(
+                    value, r"^\d+$", f"{key} in {budget_file.name} is not a non-negative integer"
+                )
 
     def test_every_schema_key_is_read_by_bench(self) -> None:
         """A key in the schema that nothing looks up is a dead budget.
@@ -4116,6 +4132,100 @@ class BudgetValueTests(unittest.TestCase):
             self.assertIn(section, bench.BUDGET_SCHEMA)
             for key in (key for pair in pairs for key in pair):
                 self.assertIn(key, bench.BUDGET_SCHEMA[section])
+
+
+class BoardBudgetTests(unittest.TestCase):
+    def test_resolve_budgets_path_defaults(self) -> None:
+        self.assertEqual(bench.resolve_budgets_path(None, None), bench.DEFAULT_BUDGETS)
+        self.assertEqual(bench.resolve_budgets_path(None, "x4"), bench.DEFAULT_BUDGETS)
+        self.assertEqual(bench.resolve_budgets_path(None, "x3"), bench.DEFAULT_BUDGETS_X3)
+
+    def test_resolve_budgets_path_explicit_overrides_board(self) -> None:
+        custom = Path("custom.toml")
+        self.assertEqual(bench.resolve_budgets_path(custom, "x3"), custom)
+        self.assertEqual(bench.resolve_budgets_path(custom, "x4"), custom)
+
+    def test_resolve_budgets_path_infers_from_events(self) -> None:
+        x3_events = [{"event": "run_start", "board": "x3"}]
+        x4_events = [{"event": "run_start", "board": "x4"}]
+        self.assertEqual(
+            bench.resolve_budgets_path(None, None, x3_events), bench.DEFAULT_BUDGETS_X3
+        )
+        self.assertEqual(bench.resolve_budgets_path(None, None, x4_events), bench.DEFAULT_BUDGETS)
+
+    def test_x4_timings_pass_shared_budgets_but_fail_x3_profile(self) -> None:
+        """X4 has ~421 ms Fast BUSY and ~470 ms turn: passes shared, fails X3."""
+        x4_events = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "refresh", "mode": "Fast", "busy_ms": 421, "t_ms": 1421},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 1470,
+                "layout_ms": 15,
+                "req_ms": 1000,
+            },
+            {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+        ]
+        shared_budgets, _ = bench.load_budgets(bench.DEFAULT_BUDGETS)
+        x3_budgets, _ = bench.load_budgets(bench.DEFAULT_BUDGETS_X3)
+
+        shared_warnings = bench.evaluate_budgets(x4_events, shared_budgets)
+        self.assertEqual(shared_warnings, [], f"shared budgets failed X4: {shared_warnings}")
+
+        x3_warnings = bench.evaluate_budgets(x4_events, x3_budgets)
+        self.assertTrue(
+            any("Fast refresh busy" in w and "350ms" in w for w in x3_warnings),
+            f"x3 profile did not catch X4 Fast BUSY: {x3_warnings}",
+        )
+        self.assertTrue(
+            any("page-turn median" in w and "400ms" in w for w in x3_warnings),
+            f"x3 profile did not catch X4 page turn median: {x3_warnings}",
+        )
+
+    def test_x3_a12_timings_pass_x3_profile_while_pre_a12_fails(self) -> None:
+        """Post-A12 X3 timings (307 ms Fast, 354 ms turn, 857 ms Full) pass; pre-A12 fails."""
+        post_a12_events = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "refresh", "mode": "Fast", "busy_ms": 307, "t_ms": 1307},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 1354,
+                "layout_ms": 15,
+                "req_ms": 1000,
+            },
+            {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+        ]
+        pre_a12_events = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "refresh", "mode": "Fast", "busy_ms": 379, "t_ms": 1379},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 1426,
+                "layout_ms": 15,
+                "req_ms": 1000,
+            },
+            {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+        ]
+        x3_budgets, _ = bench.load_budgets(bench.DEFAULT_BUDGETS_X3)
+
+        post_warnings = bench.evaluate_budgets(post_a12_events, x3_budgets)
+        self.assertEqual(post_warnings, [], f"post-A12 failed X3 profile: {post_warnings}")
+
+        pre_warnings = bench.evaluate_budgets(pre_a12_events, x3_budgets)
+        self.assertTrue(
+            any("Fast refresh busy" in w and "350ms" in w for w in pre_warnings),
+            f"x3 profile did not catch pre-A12 Fast BUSY: {pre_warnings}",
+        )
+        self.assertTrue(
+            any("page-turn median" in w and "400ms" in w for w in pre_warnings),
+            f"x3 profile did not catch pre-A12 page turn median: {pre_warnings}",
+        )
 
 
 if __name__ == "__main__":
