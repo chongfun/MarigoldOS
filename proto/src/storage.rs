@@ -123,10 +123,13 @@ pub fn is_hidden_entry(path: &str) -> bool {
 /// LFN chain, and the alias it also carries has lost the dot.
 ///
 /// **This is an early exit, not the whole rule.** FAT's own `.` and `..`
-/// entries are short-only and dot-led, so they answer `false` here. Every
-/// caller keeps the later [`is_hidden_entry`] test on the rendered alias,
-/// and that test drops those two. A caller taking this for the whole rule
-/// would be relying on its own locator check to do the same job.
+/// entries are short-only and dot-led, so they answer `false` here, and
+/// each caller still owes the filtering that drops them. The two that list
+/// directories, `for_each_child` and `nth_walkable_subdir`, render the
+/// alias and run [`is_hidden_entry`] over it, which is where those two go.
+/// The book walk, `visit_books_in`, drops directories before reaching
+/// either helper, so they do not arrive there at all. A caller that took
+/// this for the whole rule and listed directories would show them as rows.
 ///
 /// An empty long name is the buffer overflow case, not a hidden entry, and
 /// is left to the caller that already refuses it; see [`MAX_LFN_UTF8_BYTES`].
@@ -446,9 +449,15 @@ mod tests {
         );
         assert_eq!(catalog_scan_name(None, "_BOOK~1.EPU"), Some("_BOOK~1.EPU"));
         assert_eq!(catalog_scan_name(None, "NOTES.TXT"), None);
-        // FAT's own entries, should a caller ever stop filtering directories.
+        // FAT's own entries are refused, though as non-EPUBs rather than as
+        // hidden ones: the EPUB test comes first and short-circuits.
         assert_eq!(catalog_scan_name(None, "."), None);
         assert_eq!(catalog_scan_name(None, ".."), None);
+        // The hidden test on the short-name branch, reached only by a
+        // dot-led name that does end in .epub. FAT produces none, since a
+        // leading dot is not a legal 8.3 character, so this pins the rule
+        // rather than a case the card can present.
+        assert_eq!(catalog_scan_name(None, ".hidden.epub"), None);
     }
 
     /// A long name the scan could not read comes back empty, and the short
