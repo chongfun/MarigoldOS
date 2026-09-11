@@ -669,12 +669,15 @@ def run_capture(args: argparse.Namespace) -> int:
                     "counts": counts,
                 },
             )
-    budgets_path = resolve_budgets_path(
-        getattr(args, "budgets", None), getattr(args, "board", None)
-    )
+    budgets_arg = getattr(args, "budgets", None)
+    board_arg = getattr(args, "board", None)
+    auto_board = budgets_arg is None and board_arg is None
+    budgets_path = resolve_budgets_path(budgets_arg, board_arg) if not auto_board else None
     report_warnings = summarize_paths(
         [args.out],
         budgets_path,
+        board=board_arg,
+        auto_board=auto_board,
         validate_suites=args.strict,
     )
     return 1 if args.strict and report_warnings else 0
@@ -1135,24 +1138,15 @@ def write_event(out: Any, event: dict[str, Any]) -> None:
 
 
 def run_report(args: argparse.Namespace) -> int:
-    inferred_events = None
-    if (
-        getattr(args, "budgets", None) is None
-        and getattr(args, "board", None) is None
-        and args.paths
-    ):
-        try:
-            inferred_events = read_events(args.paths[0])
-        except Exception:
-            inferred_events = None
-    budgets_path = resolve_budgets_path(
-        getattr(args, "budgets", None),
-        getattr(args, "board", None),
-        inferred_events,
-    )
+    budgets_arg = getattr(args, "budgets", None)
+    board_arg = getattr(args, "board", None)
+    auto_board = budgets_arg is None and board_arg is None
+    budgets_path = resolve_budgets_path(budgets_arg, board_arg) if not auto_board else None
     report_warnings = summarize_paths(
         args.paths,
         budgets_path,
+        board=board_arg,
+        auto_board=auto_board,
         validate_suites=args.strict,
         latest_only=not getattr(args, "all", False),
     )
@@ -1178,6 +1172,8 @@ def summarize_paths(
     paths: list[Path],
     budgets_path: Path | None = None,
     *,
+    board: str | None = None,
+    auto_board: bool = False,
     validate_suites: bool = False,
     latest_only: bool = True,
 ) -> list[str]:
@@ -1196,15 +1192,6 @@ def summarize_paths(
             events.append({"event": "run_start", "file_boundary": str(path)})
         events.extend(file_events)
 
-    # `validate_suites` is the --strict flag. A strict gate that cannot load
-    # its budgets must fail loudly: exiting 0 with the checks silently absent
-    # is how a 16.7x overrun once passed clean.
-    budgets, budgets_problem = load_budgets(budgets_path)
-    if budgets_problem is not None:
-        if validate_suites:
-            raise SystemExit(f"bench report: --strict cannot enforce budgets: {budgets_problem}")
-        print(f"bench report: warning: budgets not checked: {budgets_problem}")
-
     if not events:
         print("bench report: no events")
         return ["no events parsed"] if validate_suites else []
@@ -1221,6 +1208,42 @@ def summarize_paths(
     # the device time base at every run_start, which is not a reset.
     scoped_runs = runs[-1:] if latest_only else runs
     boot_paints, boot_stages, time_warnings = boot_report(scoped_runs)
+
+    if budgets_path is None and board is not None:
+        budgets_path = BOARD_BUDGETS.get(board, DEFAULT_BUDGETS)
+    elif budgets_path is None and auto_board:
+        if latest_only:
+            budgets_path = resolve_budgets_path(None, None, events)
+        else:
+            run_boards = set()
+            for run in scoped_runs:
+                b = next(
+                    (e.get("board") for e in run if e.get("board") in BOARD_BUDGETS),
+                    "unspecified",
+                )
+                run_boards.add(b)
+            if len(run_boards) == 1:
+                b = next(iter(run_boards))
+                budgets_path = BOARD_BUDGETS.get(b, DEFAULT_BUDGETS)
+            else:
+                board_names = ", ".join(sorted(run_boards))
+                if validate_suites:
+                    raise SystemExit(
+                        f"bench report: --strict cannot evaluate pooled runs from multiple boards ({board_names}); specify --board or --budgets"
+                    )
+                print(
+                    f"bench report: warning: pooled runs contain multiple boards ({board_names}); specify --board or --budgets to enforce budgets"
+                )
+                budgets_path = None
+
+    # `validate_suites` is the --strict flag. A strict gate that cannot load
+    # its budgets must fail loudly: exiting 0 with the checks silently absent
+    # is how a 16.7x overrun once passed clean.
+    budgets, budgets_problem = load_budgets(budgets_path)
+    if budgets_problem is not None:
+        if validate_suites:
+            raise SystemExit(f"bench report: --strict cannot enforce budgets: {budgets_problem}")
+        print(f"bench report: warning: budgets not checked: {budgets_problem}")
 
     renders = [event for event in events if event.get("event") == "render"]
     reading_renders = [event for event in renders if event.get("view") == "Reading"]

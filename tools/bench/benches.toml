@@ -40,10 +40,11 @@ prestage_warn_ms = 40
 # the full waveform (857 ms measured on X3 after A12, previously 928 ms) and
 # then a 307 ms clean pass (previously 379 ms), and both are logged as
 # `refresh mode=Full`. The floor and ceiling bracket both intervals. On X4,
-# a full refresh is a single ~3.5 s waveform. The 1100 ms ceiling here brackets
-# the X3 two-pass sequence.
+# a full refresh is a single ~3.5 s waveform. The 4300 ms ceiling here brackets
+# both panels (accommodating the X4's ~3.5 s waveform). For X3-specific gating
+# (900 ms ceiling post-A12), use benches-x3.toml (--board x3).
 full_refresh_busy_min_ms = 300
-full_refresh_busy_max_ms = 1100
+full_refresh_busy_max_ms = 4300
 
 [storage-cache]
 # Warm book opens only: `storage_open` with `ram_hit=false` and no cache build

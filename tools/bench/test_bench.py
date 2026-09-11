@@ -4227,6 +4227,230 @@ class BoardBudgetTests(unittest.TestCase):
             f"x3 profile did not catch pre-A12 page turn median: {pre_warnings}",
         )
 
+    def test_x4_sleep_sync_passes_shared_budgets_but_fails_x3_profile(self) -> None:
+        """X4 Full refresh is ~3500 ms: passes shared (ceiling 4300 ms), fails X3 (ceiling 900 ms)."""
+        x4_sleep_events = [
+            {"event": "run_start", "suite": "sleep-sync"},
+            {"event": "refresh", "mode": "Full", "busy_ms": 3500, "t_ms": 5000},
+            {"event": "sleep", "phase": "refresh", "ok": True, "t_ms": 5005},
+        ]
+        shared_budgets, _ = bench.load_budgets(bench.DEFAULT_BUDGETS)
+        x3_budgets, _ = bench.load_budgets(bench.DEFAULT_BUDGETS_X3)
+
+        shared_warnings = bench.evaluate_budgets(x4_sleep_events, shared_budgets)
+        self.assertEqual(
+            shared_warnings, [], f"shared budgets failed X4 sleep-sync: {shared_warnings}"
+        )
+
+        x3_warnings = bench.evaluate_budgets(x4_sleep_events, x3_budgets)
+        self.assertTrue(
+            any("Full refresh busy" in w and "900ms" in w for w in x3_warnings),
+            f"x3 profile did not catch X4 Full refresh BUSY: {x3_warnings}",
+        )
+
+    def test_scoping_infers_x3_budgets_for_latest_when_preceded_by_x4(self) -> None:
+        """X4 run followed by X3 run: latest run infers X3 and catches pre-A12 regression."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            # Run 1: X4 healthy run
+            r1 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x4"},
+                {"event": "input", "button": "Next", "t_ms": 1000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 421, "t_ms": 1421},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 1470,
+                    "layout_ms": 15,
+                    "req_ms": 1000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            # Run 2: X3 run with pre-A12 timing (379 ms Fast BUSY: passes X4 500ms, fails X3 350ms)
+            r2 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x3"},
+                {"event": "input", "button": "Next", "t_ms": 2000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 379, "t_ms": 2379},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 2426,
+                    "layout_ms": 15,
+                    "req_ms": 2000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            with log.open("w", encoding="utf-8") as f:
+                for event in r1 + r2:
+                    f.write(json.dumps(event) + "\n")
+
+            args = argparse.Namespace(paths=[log], budgets=None, board=None, strict=True, all=False)
+            ret = bench.run_report(args)
+            self.assertEqual(ret, 1, "expected pre-A12 X3 run to fail under inferred X3 budgets")
+
+    def test_scoping_infers_x4_budgets_for_latest_when_preceded_by_x3(self) -> None:
+        """X3 run followed by X4 run: latest run infers X4 and passes healthy X4."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            # Run 1: X3 run
+            r1 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x3"},
+                {"event": "input", "button": "Next", "t_ms": 1000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 307, "t_ms": 1307},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 1354,
+                    "layout_ms": 15,
+                    "req_ms": 1000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            # Run 2: X4 healthy run (421 ms Fast BUSY: fails X3 350ms, passes X4 500ms)
+            r2 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x4"},
+                {"event": "input", "button": "Next", "t_ms": 2000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 421, "t_ms": 2421},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 2470,
+                    "layout_ms": 15,
+                    "req_ms": 2000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            with log.open("w", encoding="utf-8") as f:
+                for event in r1 + r2:
+                    f.write(json.dumps(event) + "\n")
+
+            args = argparse.Namespace(paths=[log], budgets=None, board=None, strict=True, all=False)
+            ret = bench.run_report(args)
+            self.assertEqual(ret, 0, "expected healthy X4 run to pass under inferred X4 budgets")
+
+    def test_pooled_mixed_boards_refused_under_strict(self) -> None:
+        """--all with mixed x4 and x3 runs raises SystemExit under --strict unless profile is specified."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            r1 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x4"},
+                {"event": "input", "button": "Next", "t_ms": 1000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 421, "t_ms": 1421},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 1470,
+                    "layout_ms": 15,
+                    "req_ms": 1000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            r2 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x3"},
+                {"event": "input", "button": "Next", "t_ms": 2000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 307, "t_ms": 2307},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 2354,
+                    "layout_ms": 15,
+                    "req_ms": 2000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            with log.open("w", encoding="utf-8") as f:
+                for event in r1 + r2:
+                    f.write(json.dumps(event) + "\n")
+
+            args = argparse.Namespace(paths=[log], budgets=None, board=None, strict=True, all=True)
+            with self.assertRaises(SystemExit) as ctx:
+                bench.run_report(args)
+            msg = str(ctx.exception)
+            self.assertIn("--strict cannot evaluate pooled runs from multiple boards", msg)
+            self.assertIn("x3, x4", msg)
+
+    def test_pooled_mixed_boards_allowed_with_explicit_board(self) -> None:
+        """--all with mixed x4 and x3 runs is allowed under --strict if explicit --board is passed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            r1 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x4"},
+                {"event": "input", "button": "Next", "t_ms": 1000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 421, "t_ms": 1421},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 1470,
+                    "layout_ms": 15,
+                    "req_ms": 1000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            r2 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x3"},
+                {"event": "input", "button": "Next", "t_ms": 2000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 307, "t_ms": 2307},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 2354,
+                    "layout_ms": 15,
+                    "req_ms": 2000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            with log.open("w", encoding="utf-8") as f:
+                for event in r1 + r2:
+                    f.write(json.dumps(event) + "\n")
+
+            # Explicit --board x4: both runs evaluated against shared X4 budgets
+            args = argparse.Namespace(paths=[log], budgets=None, board="x4", strict=True, all=True)
+            ret = bench.run_report(args)
+            self.assertEqual(ret, 0)
+
+    @patch("builtins.print")
+    def test_pooled_mixed_boards_warns_in_non_strict(self, mock_print) -> None:
+        """--all with mixed x4 and x3 runs in non-strict mode prints warning and does not raise."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "log.jsonl"
+            r1 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x4"},
+                {"event": "input", "button": "Next", "t_ms": 1000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 421, "t_ms": 1421},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 1470,
+                    "layout_ms": 15,
+                    "req_ms": 1000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            r2 = [
+                {"event": "run_start", "suite": "page-turn", "board": "x3"},
+                {"event": "input", "button": "Next", "t_ms": 2000},
+                {"event": "refresh", "mode": "Fast", "busy_ms": 307, "t_ms": 2307},
+                {
+                    "event": "render",
+                    "view": "Reading",
+                    "t_ms": 2354,
+                    "layout_ms": 15,
+                    "req_ms": 2000,
+                },
+                {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            ]
+            with log.open("w", encoding="utf-8") as f:
+                for event in r1 + r2:
+                    f.write(json.dumps(event) + "\n")
+
+            args = argparse.Namespace(paths=[log], budgets=None, board=None, strict=False, all=True)
+            ret = bench.run_report(args)
+            self.assertEqual(ret, 0)
+            printed = "\n".join(
+                str(call.args[0]) for call in mock_print.call_args_list if call.args
+            )
+            self.assertIn("pooled runs contain multiple boards", printed)
+
 
 if __name__ == "__main__":
     unittest.main()
