@@ -275,14 +275,29 @@ card, none yet assigned an item.
   entry counter (`upload_store::library::walk_probe`, behind the
   `bench-selftest` feature) shows about one hidden entry per visible row:
   macOS sidecars (`._*`, `.DS_Store`) the card picked up from the host.
-  They are filtered, but each still costs a FAT directory-entry read on
-  every walk. Entering that folder is 85 to 87 ms against 49 to 50 ms for a
-  7-row one, so the hidden half of the listing is a real share of the entry
-  cost. The fix is firmware-side, an early reject on the `._` prefix before
-  the name is decoded, so the cost becomes proportional to visible rows.
-  Cleaning the card is not it: a library managed from a Mac always carries
-  these entries, so the bench card keeps them by decision (2026-09-10) and
-  every folder figure in this document was measured with them present.
+  They are filtered, and this entry originally claimed their share of the
+  entry cost was worth an early reject. **Measured 2026-09-10 and withdrawn.**
+  The reject was built (`proto::storage::is_hidden_scan_entry`, called by
+  the three listing walks before they render an alias) and measured with
+  three paired folder-nav captures each way, 60 round trips per arm,
+  alternating images on one card: folder enter pooled median 29 ms both
+  ways, mean 28.8 against 28.6, leave 17.6 against 17.9. The work it removes
+  is a string format per hidden entry, microseconds against a cost that is
+  card I/O.
+
+  What misled the original entry was reading the 85 to 87 ms of a 14-row
+  folder against 49 to 50 ms of a 7-row one as per-entry work. On the 64 GB
+  card those two folders cost 28 and 29 ms, the same within noise, so the
+  gap was directory blocks to read on a slow card. The change is kept for
+  clarity rather than speed, and cleaning the card was never the
+  alternative: a library managed from a Mac always carries these entries,
+  so the bench card keeps them by decision (2026-09-10) and every folder
+  figure in this document was measured with them present.
+
+  What the same captures do point at: a folder enter is 29 ms across three
+  or four walks, and each walk re-resolves the path from the root. About
+  10 ms per walk, on a fast card, for a folder of seven rows. That is the
+  item below, and it is where the entry cost actually lives.
 - **A mixed folder is walked three times per entry.** Resolving entries and
   iterating them are separate walks and a folder holding both books and
   subfolders paid a third. Each walk re-resolves the path from the root
