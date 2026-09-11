@@ -1463,6 +1463,64 @@ fn a_post_scan_relist_either_lists_or_reports_it_could_not() {
 /// The relist retires every row number picked before it, whether or not the
 /// catalog moved. A scan whose recovery is unfinished rebuilds nothing, so
 /// the catalog epoch stands, and browsing goes back to the root anyway: a row
+/// A page the card would not read leaves no rows behind.
+///
+/// `ensure_page` runs before every Library paint and slides the resident
+/// page over the rows about to be drawn. It is best-effort by contract: a
+/// card that stalls costs that paint its rows. What it must not do is keep
+/// serving the page the reader has just scrolled off, so both ways of
+/// failing, the folder that would not open and the page that would not
+/// read, have to leave the same nothing behind.
+#[test]
+fn a_page_that_would_not_read_leaves_no_rows_behind() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 40);
+
+    let mut checked = 0usize;
+    for probe in 0..48 {
+        let mut store = Box::new(ReaderStore::new());
+        reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+        let folder = store.browse().count() - 1;
+        assert!(matches!(
+            reader_cache::browse::choose_row(&mut store, &root, folder, true),
+            reader_cache::browse::RowChoice::Entered(_)
+        ));
+        assert!(
+            store.folder_row(0).is_some(),
+            "the folder came with its first page",
+        );
+
+        // Scroll far enough that the resident page cannot cover the target,
+        // so the paint owes a read, and fail that read.
+        let far = store.browse().count() - 1;
+        disk.fault.fail_read_in.set(Some(probe));
+        let touched = reader_cache::browse::ensure_page(&mut store, &root, far, true);
+        disk.fault.fail_read_in.set(None);
+
+        if !touched {
+            continue;
+        }
+        if store.folder_row(far as usize).is_some() {
+            // The read got through despite the armed fault; nothing to check
+            // on this probe.
+            continue;
+        }
+        checked += 1;
+        assert_eq!(
+            store.folder_rows().len(),
+            0,
+            "a page that would not read leaves the resident page empty, \
+             not holding the rows the reader scrolled away from",
+        );
+    }
+    assert!(
+        checked > 0,
+        "at least one probe has to have failed a page read",
+    );
+}
+
 /// picked in the folder it left names a different child of a different place.
 #[test]
 fn a_relist_retires_the_rows_picked_before_it() {

@@ -1103,7 +1103,6 @@ where
 }
 
 /// Fill what is left of `window` from one region of a directory already open.
-#[allow(clippy::too_many_arguments)]
 fn fill_region_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,

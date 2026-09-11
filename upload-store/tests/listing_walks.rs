@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, TimeSource, Timestamp};
 use embedded_sdmmc::{Directory, VolumeIdx, VolumeManager};
+use proto::library_path::BookRoot;
 use proto::library_path::LibraryPath;
 use upload_store::library::{entry_in, open_listing, walk_probe, LibraryRow};
 
@@ -120,26 +121,6 @@ fn new_card() -> SharedDisk {
     }))
 }
 
-// The fixture disk is shared with `library_paths.rs`, which uses its fault
-// injection; this file only needs it to answer.
-#[allow(dead_code)]
-impl SharedDisk {
-    /// Refuse reads from the `n`th from now on.
-    fn fail_reads_from(&self, n: Option<u32>) {
-        *self.0.reads_seen.borrow_mut() = 0;
-        *self.0.fail_reads_from.borrow_mut() = n;
-    }
-
-    /// Start counting reads again, so a walk can be measured on its own.
-    fn reset_reads(&self) {
-        *self.0.reads_seen.borrow_mut() = 0;
-    }
-
-    fn reads(&self) -> u32 {
-        *self.0.reads_seen.borrow()
-    }
-}
-
 fn open_mgr(disk: SharedDisk) -> Mgr {
     VolumeManager::new_with_limits(disk, StaticTime, 7000)
 }
@@ -208,5 +189,106 @@ fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
     assert!(
         iterated_after > 0,
         "they do read the folder, so the counter is live",
+    );
+}
+
+/// The library root's own listing, which is the branch that reads two
+/// directories: the shelf for its books and folders, and the card root for
+/// the loose EPUBs copied on before the shelf existed.
+///
+/// Held open, the shelf is the folder being listed, so nothing is descended
+/// into and the card root stays the handle the caller passed in.
+#[test]
+fn the_library_root_lists_both_its_roots_from_one_open_listing() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    let loose = root.create_file_in_dir_lfn("Loose.epub").expect("create");
+    loose.write(b"x").expect("write");
+    loose.close().expect("close");
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    let shelved = books
+        .create_file_in_dir_lfn("Shelved.epub")
+        .expect("create");
+    shelved.write(b"x").expect("write");
+    shelved.close().expect("close");
+    books.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+
+    let listing = open_listing(&root, &path("/"))
+        .expect("read")
+        .expect("the library root");
+    let counts = listing.counts(&root).expect("count");
+    assert_eq!(
+        (counts.shelf_books, counts.root_books, counts.shelf_folders),
+        (1, 1, 1),
+        "one shelved book, one loose at the card root, one folder",
+    );
+
+    let _ = walk_probe::take();
+    let mut window: [LibraryRow; 3] = Default::default();
+    let filled = listing
+        .page(&root, counts, 0, &mut window)
+        .expect("page")
+        .expect("rows");
+    let (_, resolved, _) = walk_probe::take();
+    assert_eq!(resolved, 0, "the root listing resolves nothing to page");
+    assert_eq!(filled, 3);
+    let rows: Vec<(&str, bool, BookRoot)> = window
+        .iter()
+        .map(|row| (row.child.name.as_str(), row.child.is_dir, row.at))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("Shelved.epub", false, BookRoot::Library),
+            ("Loose.epub", false, BookRoot::CardRoot),
+            ("Fiction", true, BookRoot::Library),
+        ],
+        "the shelf's books, then the card root's, then the shelf's folders",
+    );
+}
+
+/// A card with no shelf still has a library, made of whatever sits loose at
+/// its root. The listing holds no shelf handle at all, so both halves have
+/// to answer from the card root alone.
+#[test]
+fn a_card_with_no_shelf_still_lists_its_loose_books() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    let loose = root.create_file_in_dir_lfn("Loose.epub").expect("create");
+    loose.write(b"x").expect("write");
+    loose.close().expect("close");
+
+    let listing = open_listing(&root, &path("/"))
+        .expect("read")
+        .expect("the library root");
+    let counts = listing.counts(&root).expect("count");
+    assert_eq!(
+        (counts.shelf_books, counts.root_books, counts.shelf_folders),
+        (0, 1, 0),
+        "nothing shelved, one loose book",
+    );
+
+    let mut window: [LibraryRow; 2] = Default::default();
+    let filled = listing
+        .page(&root, counts, 0, &mut window)
+        .expect("page")
+        .expect("rows");
+    assert_eq!(filled, 1);
+    assert_eq!(window[0].child.name.as_str(), "Loose.epub");
+    assert_eq!(window[0].at, BookRoot::CardRoot);
+}
+
+/// Below the shelf there is nothing to list on a card that has none, and
+/// saying so is not the same as saying the card would not answer.
+#[test]
+fn a_card_with_no_shelf_has_no_folder_below_it() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    assert!(
+        open_listing(&root, &path("Fiction"))
+            .expect("read")
+            .is_none(),
+        "a path under a shelf that is not there is an absence, not a fault",
     );
 }

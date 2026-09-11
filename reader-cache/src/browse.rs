@@ -139,13 +139,19 @@ where
         return false;
     }
     let path = store.browse().path().clone();
-    match open_listing(card_root, &path).ok().flatten() {
-        Some(listing) => {
-            let _ = read_page(store, card_root, &listing, start);
-        }
+    let read = match open_listing(card_root, &path).ok().flatten() {
+        Some(listing) => read_page(store, card_root, &listing, start).is_some(),
+        None => false,
+    };
+    if !read {
         // Best-effort, as the doc above says: a card that would not answer
-        // costs this paint its rows.
-        None => store.begin_folder_page(start),
+        // costs this paint its rows. Both ways of failing cost the same,
+        // whether the card would not open the folder or would not read the
+        // page: the resident rows belong to the offset this call was asked
+        // to move away from, and leaving them would keep serving a page the
+        // reader has scrolled off. `read_page` mutates nothing until its own
+        // read has succeeded, so there is no half-filled page to undo.
+        store.begin_folder_page(start);
     }
     true
 }
