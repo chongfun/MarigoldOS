@@ -1,9 +1,14 @@
 //! One resolution serves a whole listing, however many pages it reads.
 //!
 //! Its own test binary on purpose. `walk_probe`'s counters are
-//! process-global and Cargo runs the tests within one file across threads,
-//! so a count read here would carry whatever another test's walk had added
-//! to it. One file, one test, nothing else touching the counters.
+//! process-global, so a count read here would otherwise carry whatever
+//! another file's walk had added to it.
+//!
+//! Cargo runs one file's tests across threads too, and that is the same
+//! hazard one level down: a test reading the counters sees the walks of
+//! whichever test is running beside it. So every test here takes
+//! [`one_at_a_time`] first, including the ones that read no counter, since
+//! their walks are what the others would miscount.
 #![cfg(feature = "bench-selftest")]
 
 use std::cell::RefCell;
@@ -139,6 +144,16 @@ fn child<'a>(dir: &Dir<'a>, name: &str) -> Dir<'a> {
     dir.open_dir(entry.alias).expect("open")
 }
 
+/// Serializes this file's tests. Held for the whole of each one.
+///
+/// A poisoned lock is passed through rather than unwrapped: one test that
+/// panicked has failed already, and taking the rest down with it hides
+/// whatever else was wrong.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn path(text: &str) -> LibraryPath {
     LibraryPath::parse(text).expect("parse")
 }
@@ -154,6 +169,7 @@ fn path(text: &str) -> LibraryPath {
 /// as a pass here and fail only in the wrapper tests next door.
 #[test]
 fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
+    let _serial = one_at_a_time();
     let mgr = open_mgr(new_card());
     let root = open_root(&mgr);
     root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
@@ -223,6 +239,7 @@ fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
 /// scans rather than one and a per-page resolution would cost the most.
 #[test]
 fn a_listing_two_folders_down_resolves_once_as_well() {
+    let _serial = one_at_a_time();
     let mgr = open_mgr(new_card());
     let root = open_root(&mgr);
     root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
@@ -283,6 +300,7 @@ fn a_listing_two_folders_down_resolves_once_as_well() {
 /// into and the card root stays the handle the caller passed in.
 #[test]
 fn the_library_root_lists_both_its_roots_from_one_open_listing() {
+    let _serial = one_at_a_time();
     let mgr = open_mgr(new_card());
     let root = open_root(&mgr);
     let loose = root.create_file_in_dir_lfn("Loose.epub").expect("create");
@@ -336,6 +354,7 @@ fn the_library_root_lists_both_its_roots_from_one_open_listing() {
 /// to answer from the card root alone.
 #[test]
 fn a_card_with_no_shelf_still_lists_its_loose_books() {
+    let _serial = one_at_a_time();
     let mgr = open_mgr(new_card());
     let root = open_root(&mgr);
     let loose = root.create_file_in_dir_lfn("Loose.epub").expect("create");
@@ -366,6 +385,7 @@ fn a_card_with_no_shelf_still_lists_its_loose_books() {
 /// saying so is not the same as saying the card would not answer.
 #[test]
 fn a_card_with_no_shelf_has_no_folder_below_it() {
+    let _serial = one_at_a_time();
     let mgr = open_mgr(new_card());
     let root = open_root(&mgr);
     assert!(
