@@ -272,6 +272,12 @@ where
         if entry.attributes.is_volume() {
             return ControlFlow::Continue(());
         }
+        // No hidden-entry reject here, deliberately. Resolution answers for
+        // a locator already held, and a dot-led folder is addressable even
+        // though no listing offers one: `is_hidden_entry` examines the last
+        // segment alone so that `/.hidden/x.epub` still resolves. Refusing
+        // them here would strand any book below such a folder, and the
+        // saving would be one string comparison per sidecar.
         let alias = entry.name;
         selector.offer(
             long,
@@ -545,6 +551,12 @@ where
             if entry.attributes.is_volume() {
                 return ControlFlow::Continue(());
             }
+            // Platform metadata goes first, decided from the long name
+            // alone, so a card written from a Mac does not pay to render and
+            // measure an alias for a sidecar beside every book it holds.
+            if proto::storage::is_hidden_scan_entry(long) {
+                return ControlFlow::Continue(());
+            }
             let alias = entry.name;
             // A short-only entry shows its alias, so it is rendered here.
             // The buffer is sized so it cannot overflow, since an alias that
@@ -561,6 +573,9 @@ where
                 Some(long) => long,
                 None => rendered.as_str(),
             };
+            // A short-only entry has reached here unexamined: its alias
+            // cannot be dot-led, and the test is kept over both branches
+            // rather than skipped on one.
             if proto::storage::is_hidden_entry(shown) {
                 return ControlFlow::Continue(());
             }
@@ -634,6 +649,9 @@ where
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
             return ControlFlow::Continue(());
         }
+        if proto::storage::is_hidden_scan_entry(long) {
+            return ControlFlow::Continue(());
+        }
         let mut rendered = heapless::String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();
         if write!(rendered, "{}", entry.name).is_err() {
             return ControlFlow::Continue(());
@@ -680,6 +698,9 @@ where
     let mut found = None;
     let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
         if !entry.attributes.is_directory() || entry.attributes.is_volume() {
+            return ControlFlow::Continue(());
+        }
+        if proto::storage::is_hidden_scan_entry(long) {
             return ControlFlow::Continue(());
         }
         let mut rendered = heapless::String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();

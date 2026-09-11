@@ -113,6 +113,23 @@ pub fn is_hidden_entry(path: &str) -> bool {
     path.rsplit('/').next().unwrap_or(path).starts_with('.')
 }
 
+/// Whether a scanned directory entry is platform metadata, decided from the
+/// long name alone.
+///
+/// Takes the `long` half of what an `iterate_dir_lfn` callback receives, so a
+/// walk can drop a sidecar before rendering its 8.3 alias or measuring its
+/// locator. A hidden entry always has a long name: a leading dot is not a
+/// legal 8.3 character, so FAT gives `._<book>.epub` an LFN chain and the
+/// alias it also carries has lost the dot. The long name alone therefore
+/// decides, and this cannot miss one that [`is_hidden_entry`] would catch
+/// later.
+///
+/// An empty long name is the buffer overflow case, not a hidden entry, and
+/// is left to the caller that already refuses it; see [`MAX_LFN_UTF8_BYTES`].
+pub fn is_hidden_scan_entry(long_name: Option<&str>) -> bool {
+    matches!(long_name, Some(name) if is_hidden_entry(name))
+}
+
 /// How many UTF-8 bytes a FAT long filename can occupy, and so how large a
 /// buffer the SD scan must lend `embedded-sdmmc` to assemble one.
 ///
@@ -353,6 +370,14 @@ mod tests {
     /// duplicate of a real book that can never open.
     #[test]
     fn appledouble_sidecars_are_not_books() {
+        assert!(is_hidden_scan_entry(Some("._book.epub")));
+        assert!(is_hidden_scan_entry(Some(".DS_Store")));
+        // The alias half does not decide: a sidecar's alias has lost its dot,
+        // and an entry with no long name cannot be dot-led at all.
+        assert!(!is_hidden_scan_entry(None));
+        assert!(!is_hidden_scan_entry(Some("book.epub")));
+        // The overflow case belongs to the caller that refuses it.
+        assert!(!is_hidden_scan_entry(Some("")));
         assert!(is_hidden_entry("._book.epub"));
         assert!(is_hidden_entry("/._book.epub"));
         assert!(is_hidden_entry("/books/._book.epub"));
