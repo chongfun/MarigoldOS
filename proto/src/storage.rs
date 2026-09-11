@@ -113,16 +113,20 @@ pub fn is_hidden_entry(path: &str) -> bool {
     path.rsplit('/').next().unwrap_or(path).starts_with('.')
 }
 
-/// Whether a scanned directory entry is platform metadata, decided from the
-/// long name alone.
+/// Whether a scanned directory entry is platform metadata a walk can drop
+/// before it renders the entry's alias.
 ///
-/// Takes the `long` half of what an `iterate_dir_lfn` callback receives, so a
-/// walk can drop a sidecar before rendering its 8.3 alias or measuring its
-/// locator. A hidden entry always has a long name: a leading dot is not a
-/// legal 8.3 character, so FAT gives `._<book>.epub` an LFN chain and the
-/// alias it also carries has lost the dot. The long name alone therefore
-/// decides, and this cannot miss one that [`is_hidden_entry`] would catch
-/// later.
+/// Takes the `long` half of what an `iterate_dir_lfn` callback receives, so
+/// a walk can drop a sidecar before rendering its 8.3 alias or measuring its
+/// locator. Every dot-led entry a writer creates has a long name, since a
+/// leading dot is not a legal 8.3 character: FAT gives `._<book>.epub` an
+/// LFN chain, and the alias it also carries has lost the dot.
+///
+/// **This is an early exit, not the whole rule.** FAT's own `.` and `..`
+/// entries are short-only and dot-led, so they answer `false` here. Every
+/// caller keeps the later [`is_hidden_entry`] test on the rendered alias,
+/// and that test drops those two. A caller taking this for the whole rule
+/// would be relying on its own locator check to do the same job.
 ///
 /// An empty long name is the buffer overflow case, not a hidden entry, and
 /// is left to the caller that already refuses it; see [`MAX_LFN_UTF8_BYTES`].
@@ -372,10 +376,14 @@ mod tests {
     fn appledouble_sidecars_are_not_books() {
         assert!(is_hidden_scan_entry(Some("._book.epub")));
         assert!(is_hidden_scan_entry(Some(".DS_Store")));
-        // The alias half does not decide: a sidecar's alias has lost its dot,
-        // and an entry with no long name cannot be dot-led at all.
-        assert!(!is_hidden_scan_entry(None));
         assert!(!is_hidden_scan_entry(Some("book.epub")));
+        // The alias half does not decide, since a sidecar's alias has lost
+        // its dot. An entry with no long name is left to the later check,
+        // and FAT's `.` and `..` are exactly that case: short-only, dot-led,
+        // and caught by `is_hidden_entry` on the rendered alias.
+        assert!(!is_hidden_scan_entry(None));
+        assert!(is_hidden_entry("."));
+        assert!(is_hidden_entry(".."));
         // The overflow case belongs to the caller that refuses it.
         assert!(!is_hidden_scan_entry(Some("")));
         assert!(is_hidden_entry("._book.epub"));
