@@ -37,6 +37,29 @@ except ImportError:  # pragma: no cover - non-POSIX hosts cannot capture serial.
 DEFAULT_PORT = "/dev/cu.usbmodem101"
 DEFAULT_OUT = Path("target/bench/latest.jsonl")
 DEFAULT_BUDGETS = Path(__file__).with_name("benches.toml")
+DEFAULT_BUDGETS_X3 = Path(__file__).with_name("benches-x3.toml")
+BOARD_BUDGETS: dict[str, Path] = {
+    "x4": DEFAULT_BUDGETS,
+    "x3": DEFAULT_BUDGETS_X3,
+}
+
+
+def resolve_budgets_path(
+    budgets: Path | None,
+    board: str | None = None,
+    events: list[dict[str, Any]] | None = None,
+) -> Path:
+    if budgets is not None:
+        return budgets
+    if board and board in BOARD_BUDGETS:
+        return BOARD_BUDGETS[board]
+    if events:
+        for event in events:
+            b = event.get("board")
+            if b in BOARD_BUDGETS:
+                return BOARD_BUDGETS[b]
+    return DEFAULT_BUDGETS
+
 
 LEGACY_RENDER_RE = re.compile(
     r"bench: render (?P<view>\w+) (?P<mode>\w+) page=(?P<page>\d+) "
@@ -222,7 +245,18 @@ def main() -> int:
 
     report = sub.add_parser("report", help="summarize one or more bench JSONL logs")
     report.add_argument("paths", nargs="+", type=Path)
-    report.add_argument("--budgets", type=Path, default=DEFAULT_BUDGETS)
+    report.add_argument(
+        "--budgets",
+        type=Path,
+        default=None,
+        help="budgets TOML file to enforce (default: benches.toml)",
+    )
+    report.add_argument(
+        "--board",
+        choices=["x4", "x3"],
+        default=None,
+        help="board profile for budget selection (x3 selects benches-x3.toml)",
+    )
     report.add_argument("--strict", action="store_true", help="exit non-zero on budget warnings")
     report.add_argument(
         "--all",
@@ -273,6 +307,18 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     )
     p.add_argument("--espflash", default="espflash", help="espflash executable")
     p.add_argument("--strict", action="store_true", help="exit non-zero on budget warnings")
+    p.add_argument(
+        "--budgets",
+        type=Path,
+        default=None,
+        help="budgets TOML file to enforce (default: benches.toml)",
+    )
+    p.add_argument(
+        "--board",
+        choices=["x4", "x3"],
+        default=None,
+        help="board profile for budget selection (x3 selects benches-x3.toml)",
+    )
     p.add_argument("--note", action="append", default=[], help="free-form note stored in metadata")
     p.add_argument("--book", default=None, help="operator label for the book under test")
     if name == "page-turn":
@@ -562,6 +608,8 @@ def run_capture(args: argparse.Namespace) -> int:
         # carries a completion contract at all.
         "requested": requested,
     }
+    if getattr(args, "board", None):
+        metadata["board"] = args.board
     counts: dict[str, int] = {}
     command_started = time.monotonic()
     # Reassigned once the device is back and the port is readable: a reset and
@@ -621,9 +669,15 @@ def run_capture(args: argparse.Namespace) -> int:
                     "counts": counts,
                 },
             )
+    budgets_arg = getattr(args, "budgets", None)
+    board_arg = getattr(args, "board", None)
+    auto_board = budgets_arg is None and board_arg is None
+    budgets_path = resolve_budgets_path(budgets_arg, board_arg) if not auto_board else None
     report_warnings = summarize_paths(
         [args.out],
-        DEFAULT_BUDGETS,
+        budgets_path,
+        board=board_arg,
+        auto_board=auto_board,
         validate_suites=args.strict,
     )
     return 1 if args.strict and report_warnings else 0
@@ -1084,9 +1138,15 @@ def write_event(out: Any, event: dict[str, Any]) -> None:
 
 
 def run_report(args: argparse.Namespace) -> int:
+    budgets_arg = getattr(args, "budgets", None)
+    board_arg = getattr(args, "board", None)
+    auto_board = budgets_arg is None and board_arg is None
+    budgets_path = resolve_budgets_path(budgets_arg, board_arg) if not auto_board else None
     report_warnings = summarize_paths(
         args.paths,
-        args.budgets,
+        budgets_path,
+        board=board_arg,
+        auto_board=auto_board,
         validate_suites=args.strict,
         latest_only=not getattr(args, "all", False),
     )
@@ -1112,6 +1172,8 @@ def summarize_paths(
     paths: list[Path],
     budgets_path: Path | None = None,
     *,
+    board: str | None = None,
+    auto_board: bool = False,
     validate_suites: bool = False,
     latest_only: bool = True,
 ) -> list[str]:
@@ -1130,15 +1192,6 @@ def summarize_paths(
             events.append({"event": "run_start", "file_boundary": str(path)})
         events.extend(file_events)
 
-    # `validate_suites` is the --strict flag. A strict gate that cannot load
-    # its budgets must fail loudly: exiting 0 with the checks silently absent
-    # is how a 16.7x overrun once passed clean.
-    budgets, budgets_problem = load_budgets(budgets_path)
-    if budgets_problem is not None:
-        if validate_suites:
-            raise SystemExit(f"bench report: --strict cannot enforce budgets: {budgets_problem}")
-        print(f"bench report: warning: budgets not checked: {budgets_problem}")
-
     if not events:
         print("bench report: no events")
         return ["no events parsed"] if validate_suites else []
@@ -1155,6 +1208,42 @@ def summarize_paths(
     # the device time base at every run_start, which is not a reset.
     scoped_runs = runs[-1:] if latest_only else runs
     boot_paints, boot_stages, time_warnings = boot_report(scoped_runs)
+
+    if budgets_path is None and board is not None:
+        budgets_path = BOARD_BUDGETS.get(board, DEFAULT_BUDGETS)
+    elif budgets_path is None and auto_board:
+        if latest_only:
+            budgets_path = resolve_budgets_path(None, None, events)
+        else:
+            run_boards = set()
+            for run in scoped_runs:
+                b = next(
+                    (e.get("board") for e in run if e.get("board") in BOARD_BUDGETS),
+                    "unspecified",
+                )
+                run_boards.add(b)
+            if len(run_boards) == 1:
+                b = next(iter(run_boards))
+                budgets_path = BOARD_BUDGETS.get(b, DEFAULT_BUDGETS)
+            else:
+                board_names = ", ".join(sorted(run_boards))
+                if validate_suites:
+                    raise SystemExit(
+                        f"bench report: --strict cannot evaluate pooled runs from multiple boards ({board_names}); specify --board or --budgets"
+                    )
+                print(
+                    f"bench report: warning: pooled runs contain multiple boards ({board_names}); specify --board or --budgets to enforce budgets"
+                )
+                budgets_path = None
+
+    # `validate_suites` is the --strict flag. A strict gate that cannot load
+    # its budgets must fail loudly: exiting 0 with the checks silently absent
+    # is how a 16.7x overrun once passed clean.
+    budgets, budgets_problem = load_budgets(budgets_path)
+    if budgets_problem is not None:
+        if validate_suites:
+            raise SystemExit(f"bench report: --strict cannot enforce budgets: {budgets_problem}")
+        print(f"bench report: warning: budgets not checked: {budgets_problem}")
 
     renders = [event for event in events if event.get("event") == "render"]
     reading_renders = [event for event in renders if event.get("view") == "Reading"]

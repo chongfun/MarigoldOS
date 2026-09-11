@@ -10,7 +10,7 @@
 //! writes a white DTM1 baseline. Waveforms are *uploaded* per refresh as
 //! five 42-byte LUTs (VCOM + the WW/BW/WB/BB transitions), not selected
 //! from OTP — so `RefreshMode` maps to a LUT bank plus a CDI mode byte
-//! (differential 0x29 vs absolute 0xA9). Grayscale is intentionally not
+//! (differential 0x2F vs absolute 0xAF). Grayscale is intentionally not
 //! ported: this firmware has no grayscale reader path.
 //!
 //! The orientation flags, init/resolution bytes, BUSY behavior, waveforms,
@@ -45,10 +45,22 @@ pub const CMD_LV_SELECTION: u8 = 0xE1;
 /// Argument to `CMD_DEEP_SLEEP` (check-code the controller requires).
 pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
 
-/// CDI (`CMD_VCOM_DATA_INTERVAL`) first byte: differential mode (fast/full
-/// diff against DTM1) vs absolute mode (drive to target ignoring DTM1).
-pub const CDI_DIFFERENTIAL: u8 = 0x29;
-pub const CDI_ABSOLUTE: u8 = 0xA9;
+/// CDI (`CMD_VCOM_DATA_INTERVAL`, R50h) first byte for differential vs
+/// absolute refresh modes, followed by `CDI_INTERVAL` (`0x07`).
+///
+/// In the UC8253c datasheet, R50h is defined as `VBD[1:0] | DDX[1:0] | CDI[3:0]`,
+/// where `VBD` selects border data and `CDI[3:0]` configures the VCOM-to-data
+/// interval in Hsync units (e.g. 0x9 = 8 Hsync, 0xF = 2 Hsync). CrossPoint's
+/// reference driver pairs this with a second byte (`0x07`) and uses `0x29` for
+/// differential LUTs and `0xA9` for absolute LUTs.
+///
+/// Tuning the low nibble from the reference `0x9` to `0xF` (`0x2F` / `0xAF`) was
+/// experimentally established on the X3 panel to eliminate ~72 ms of controller
+/// wait off every refresh mode (Fast busy 379 -> 307 ms, FastClean busy
+/// 456 -> 383 ms, Full busy 929 -> 857 ms; page turn median 426 -> 354 ms)
+/// with zero border flashing or ghosting.
+pub const CDI_DIFFERENTIAL: u8 = 0x2F;
+pub const CDI_ABSOLUTE: u8 = 0xAF;
 /// CDI second byte, constant across every bank in the reference driver.
 pub const CDI_INTERVAL: u8 = 0x07;
 

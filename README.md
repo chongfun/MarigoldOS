@@ -1,7 +1,7 @@
 # CalendulaOS
 
 Open firmware for the Xteink X3 and X4 e-readers. Bare-metal Rust, `no_std` on
-an ESP32-C3, no heap on the reading path, ~424 ms page turns on the X3 (379 ms
+an ESP32-C3, no heap on the reading path, ~354 ms page turns on the X3 (307 ms
 of which is the panel itself).
 
 [![Flashing](https://img.shields.io/badge/Flashing-2b2b2b?style=flat)](docs/FLASHING.md)

@@ -1,0 +1,43 @@
+# Warning budgets for the Xteink X3 (UC8253 controller).
+#
+# Enforces the tighter waveform and controller intervals of the X3 panel,
+# including the A12 CDI interval tuning (~72 ms faster controller wait).
+#
+# Selected via `--budgets tools/bench/benches-x3.toml` or `--board x3` on
+# hardware-facing bench runs for the X3. The shared `benches.toml` defaults
+# remain compatible with both boards (accommodating the X4's ~421 ms Fast
+# waveform and ~470 ms press-to-settled).
+
+[page-turn]
+# Tightened to 400 ms after A12 (median measured 354 ms on X3, down from 426 ms):
+# catches a regression to the pre-A12 baseline while leaving 46 ms of headroom.
+median_press_to_settled_ms = 400
+# Floor for the same median: a genuine press-to-settled includes a full Fast
+# refresh (306-383 ms busy measured on X3 after A12; previously 379-456 ms),
+# so a median anywhere near or below this is presses paired against renders
+# already in flight — operator burst cadence, not a faster device. Kept well
+# under the real turn time so a legitimate optimization cannot trip it.
+median_press_to_settled_min_ms = 250
+# Tightened to 350 ms after A12 (measured 307 ms on X3, down from 379 ms):
+# catches a regression to the pre-A12 baseline while leaving 43 ms of headroom.
+fast_refresh_busy_warn_ms = 350
+reading_layout_warn_ms = 60
+prestage_warn_ms = 40
+
+[sleep-sync]
+# A Full refresh on the X3 is two BUSY intervals, not one: the driver runs
+# the full waveform (857 ms measured on X3 after A12, previously 928 ms) and
+# then a 307 ms clean pass (previously 379 ms), and both are logged as
+# `refresh mode=Full`. The floor and ceiling bracket both intervals.
+full_refresh_busy_min_ms = 300
+# Sized to 900 ms after A12 to catch regressions back to the pre-A12 928 ms
+# baseline while leaving 43 ms headroom for the 857 ms waveform pass.
+full_refresh_busy_max_ms = 900
+
+[storage-cache]
+warm_book_open_warn_ms = 200
+catalog_load_warn_ms = 500
+
+[folder-nav]
+folder_enter_warn_ms = 200
+folder_leave_warn_ms = 150

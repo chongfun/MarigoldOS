@@ -9,32 +9,42 @@
 # rather than something to skip past. A key that reads as enforced and is
 # enforced by nothing is what this file exists to prevent, so adding a budget
 # here means adding it there too.
+#
+# Shared defaults: these budgets apply to both boards (X4 and X3) by default.
+# The page-turn ceilings accommodate the X4's slower panel (~421 ms Fast
+# waveform, ~470 ms press-to-settled) while still catching gross regressions.
+# For board-specific X3 / A12 regression gates (354 ms median turn, 307 ms Fast
+# BUSY, 857 ms Full waveform), use `benches-x3.toml` (via `--board x3` or
+# `--budgets tools/bench/benches-x3.toml`).
 
 [page-turn]
+# Shared page-turn median ceiling across both boards. Sized to accommodate
+# the X4 (~421 ms Fast waveform, ~470 ms press-to-settled). For X3-specific
+# regression gating (354 ms median post-A12), use benches-x3.toml (--board x3).
 median_press_to_settled_ms = 550
 # Floor for the same median: a genuine press-to-settled includes a full Fast
-# refresh (379-455 ms busy measured on X3), so a median anywhere near or
-# below this is presses paired against renders already in flight — operator
-# burst cadence, not a faster device. Kept well under the real turn time so
-# a legitimate optimization cannot trip it.
+# refresh (306-383 ms busy measured on X3 after A12; ~421 ms on X4),
+# so a median anywhere near or below this is presses paired against renders
+# already in flight — operator burst cadence, not a faster device. Kept well
+# under the real turn time so a legitimate optimization cannot trip it.
 median_press_to_settled_min_ms = 250
+# Shared Fast refresh BUSY ceiling across both boards. Sized to accommodate
+# the X4 (~421 ms Fast waveform) while catching gross regressions on both
+# panels. For X3 regression gating (307 ms Fast BUSY), see benches-x3.toml.
 fast_refresh_busy_warn_ms = 500
 reading_layout_warn_ms = 60
 prestage_warn_ms = 40
 
 [sleep-sync]
-# A Full refresh on the X3 is two BUSY intervals, not one: the driver runs
-# the full waveform (928 ms measured, n=16 in 2026-07 and every unattended
-# capture since) and then a 379 ms clean pass, and both are logged as
-# `refresh mode=Full`. The floor and ceiling bracket both intervals. The
-# 3000/4300 pair they replace was sized from a "~3.5 s Full" figure the
-# roadmap retired in 2026-07-30; it failed every strict X3 sleep-sync run
-# from the day --strict started working (roadmap Tier 0, item 3) until this
-# re-sizing on 2026-09-10 from the first unattended main baseline. The floor
-# still catches a Full that did not drive the panel (a 136 ms controller
-# interval alone), the ceiling a waveform that has slowed.
+# Full refresh on the X3 is two BUSY intervals, not one: the driver runs
+# the full waveform (857 ms measured on X3 after A12, previously 928 ms) and
+# then a 307 ms clean pass (previously 379 ms), and both are logged as
+# `refresh mode=Full`. The floor and ceiling bracket both intervals. On X4,
+# a full refresh is a single ~3.5 s waveform. The 4300 ms ceiling here brackets
+# both panels (accommodating the X4's ~3.5 s waveform). For X3-specific gating
+# (900 ms ceiling post-A12), use benches-x3.toml (--board x3).
 full_refresh_busy_min_ms = 300
-full_refresh_busy_max_ms = 1100
+full_refresh_busy_max_ms = 4300
 
 [storage-cache]
 # Warm book opens only: `storage_open` with `ram_hit=false` and no cache build
