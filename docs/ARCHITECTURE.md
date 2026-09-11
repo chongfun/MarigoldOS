@@ -382,7 +382,7 @@ bit `0`, row-major.
 Geometry and fast-refresh timing depend on the board:
 
 - **X4**: SSD1677, 100-byte rows, ~421 ms fast waveform.
-- **X3**: UC8253, 99-byte rows, ~379 ms fast waveform.
+- **X3**: UC8253, 99-byte rows, ~307 ms fast waveform (down from 379 ms via CDI interval tuning).
 
 ### Which controller is on the bus
 
@@ -1056,7 +1056,7 @@ flash/NVM fallback remains separate from the record format.
 
 | | |
 |---|---|
-| Page turn | ~424 ms press-to-settled on X3 (379 ms panel BUSY) |
+| Page turn | ~354 ms press-to-settled on X3 (307 ms panel BUSY) |
 | Wake from sleep | one flicker, ~1.5 s (deep-sleep Power-button wake only: the boot reads the RTC wake cause plus an RTC-RAM marker the sleep handshake writes after the sleep frame settles, and seeds the refresh planner with the sleep screen it knows the panel holds; a battery pull, crash, or a sleep whose final flush failed boots with unknown panel contents and pays the full 3.5 s) |
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
