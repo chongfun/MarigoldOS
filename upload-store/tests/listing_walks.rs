@@ -1,0 +1,212 @@
+//! One resolution serves a whole listing, however many pages it reads.
+//!
+//! Its own test binary on purpose. `walk_probe`'s counters are
+//! process-global and Cargo runs the tests within one file across threads,
+//! so a count read here would carry whatever another test's walk had added
+//! to it. One file, one test, nothing else touching the counters.
+#![cfg(feature = "bench-selftest")]
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, TimeSource, Timestamp};
+use embedded_sdmmc::{Directory, VolumeIdx, VolumeManager};
+use proto::library_path::LibraryPath;
+use upload_store::library::{entry_in, open_listing, walk_probe, LibraryRow};
+
+const BLOCK_BYTES: usize = 512;
+// Large enough that fatfs picks FAT16, which the driver supports.
+const DISK_BLOCKS: u32 = 32 * 1024;
+const PART_START_BLOCK: u32 = 64;
+
+struct RamDisk {
+    data: RefCell<Vec<u8>>,
+    /// Reads fail from this one onward, so a directory walk can fail the way
+    /// a card does rather than the way a missing name does.
+    fail_reads_from: RefCell<Option<u32>>,
+    reads_seen: RefCell<u32>,
+}
+
+#[derive(Debug)]
+struct DiskError;
+
+impl core::fmt::Display for DiskError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "disk error")
+    }
+}
+
+impl std::error::Error for DiskError {}
+
+#[derive(Clone)]
+struct SharedDisk(Rc<RamDisk>);
+
+impl BlockDevice for SharedDisk {
+    type Error = DiskError;
+
+    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), DiskError> {
+        {
+            let mut seen = self.0.reads_seen.borrow_mut();
+            *seen += 1;
+            if self
+                .0
+                .fail_reads_from
+                .borrow()
+                .is_some_and(|at| *seen >= at)
+            {
+                return Err(DiskError);
+            }
+        }
+        let data = self.0.data.borrow();
+        for (i, block) in blocks.iter_mut().enumerate() {
+            let at = (start.0 as usize + i) * BLOCK_BYTES;
+            block.copy_from_slice(&data[at..at + BLOCK_BYTES]);
+        }
+        Ok(())
+    }
+
+    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), DiskError> {
+        let mut data = self.0.data.borrow_mut();
+        for (i, block) in blocks.iter().enumerate() {
+            let at = (start.0 as usize + i) * BLOCK_BYTES;
+            data[at..at + BLOCK_BYTES].copy_from_slice(&block[..]);
+        }
+        Ok(())
+    }
+
+    fn num_blocks(&self) -> Result<BlockCount, DiskError> {
+        Ok(BlockCount(DISK_BLOCKS))
+    }
+}
+
+struct StaticTime;
+
+impl TimeSource for StaticTime {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+            year_since_1970: 55,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
+type Mgr = VolumeManager<SharedDisk, StaticTime, 8, 8, 1>;
+type Dir<'a> = Directory<'a, SharedDisk, StaticTime, 8, 8, 1>;
+
+fn format_disk() -> Vec<u8> {
+    let mut data = vec![0u8; DISK_BLOCKS as usize * BLOCK_BYTES];
+    data[446 + 4] = 0x06;
+    data[446 + 8..446 + 12].copy_from_slice(&PART_START_BLOCK.to_le_bytes());
+    let sectors = DISK_BLOCKS - PART_START_BLOCK;
+    data[446 + 12..446 + 16].copy_from_slice(&sectors.to_le_bytes());
+    data[510] = 0x55;
+    data[511] = 0xAA;
+    let part_start = PART_START_BLOCK as usize * BLOCK_BYTES;
+    let part_len = sectors as usize * BLOCK_BYTES;
+    let cursor = std::io::Cursor::new(&mut data[part_start..part_start + part_len]);
+    fatfs::format_volume(cursor, fatfs::FormatVolumeOptions::new()).expect("format");
+    data
+}
+
+fn new_card() -> SharedDisk {
+    SharedDisk(Rc::new(RamDisk {
+        data: RefCell::new(format_disk()),
+        fail_reads_from: RefCell::new(None),
+        reads_seen: RefCell::new(0),
+    }))
+}
+
+// The fixture disk is shared with `library_paths.rs`, which uses its fault
+// injection; this file only needs it to answer.
+#[allow(dead_code)]
+impl SharedDisk {
+    /// Refuse reads from the `n`th from now on.
+    fn fail_reads_from(&self, n: Option<u32>) {
+        *self.0.reads_seen.borrow_mut() = 0;
+        *self.0.fail_reads_from.borrow_mut() = n;
+    }
+
+    /// Start counting reads again, so a walk can be measured on its own.
+    fn reset_reads(&self) {
+        *self.0.reads_seen.borrow_mut() = 0;
+    }
+
+    fn reads(&self) -> u32 {
+        *self.0.reads_seen.borrow()
+    }
+}
+
+fn open_mgr(disk: SharedDisk) -> Mgr {
+    VolumeManager::new_with_limits(disk, StaticTime, 7000)
+}
+
+fn open_root(mgr: &Mgr) -> Dir<'_> {
+    let volume = mgr.open_volume(VolumeIdx(0)).expect("volume");
+    let raw = volume.to_raw_volume();
+    let raw_root = mgr.open_root_dir(raw).expect("root");
+    Directory::new(raw_root, mgr)
+}
+
+/// Descend by long name, since making a directory hands back nothing to
+/// descend through.
+fn child<'a>(dir: &Dir<'a>, name: &str) -> Dir<'a> {
+    let entry = entry_in(dir, name).expect("read").expect("present");
+    dir.open_dir(entry.alias).expect("open")
+}
+
+fn path(text: &str) -> LibraryPath {
+    LibraryPath::parse(text).expect("parse")
+}
+
+/// The guard is entry counts rather than time. Resolving a path scans every
+/// entry of each directory on the way, so a second resolution shows up as
+/// resolve entries climbing with each page read. Before this, entering a
+/// folder resolved it for the count and again for the page, and walking a
+/// folder a window at a time resolved it once per window.
+#[test]
+fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    books.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = child(&books, "Fiction");
+    for n in 0..6 {
+        let file = fiction
+            .create_file_in_dir_lfn(&format!("Book {n}.epub"))
+            .expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+
+    let _ = walk_probe::take();
+    let listing = open_listing(&root, &path("Fiction"))
+        .expect("read")
+        .expect("a directory");
+    let (_, resolved_opening, _) = walk_probe::take();
+    assert!(
+        resolved_opening > 0,
+        "opening the listing walks the card to the folder",
+    );
+
+    let counts = listing.counts(&root).expect("count");
+    assert_eq!(counts.total(), 6, "the fixture is what the walk reads");
+    let mut window: [LibraryRow; 2] = Default::default();
+    listing.page(&root, counts, 0, &mut window).expect("page");
+    listing.page(&root, counts, 2, &mut window).expect("page");
+    listing.page(&root, counts, 4, &mut window).expect("page");
+    let (_, resolved_after, iterated_after) = walk_probe::take();
+
+    assert_eq!(
+        resolved_after, 0,
+        "a count and three pages off an open listing resolve nothing",
+    );
+    assert!(
+        iterated_after > 0,
+        "they do read the folder, so the counter is live",
+    );
+}

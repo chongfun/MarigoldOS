@@ -18,7 +18,7 @@
 use app_core::browse::{Chosen, Row};
 use embedded_sdmmc::{Directory, TimeSource};
 use proto::library_path::{BookRoot, LibraryPath};
-use upload_store::library::{count_library_rows, page_library_rows, LibraryRow};
+use upload_store::library::{open_listing, LibraryRow, OpenListing};
 
 use crate::store::{ReaderStore, LIBRARY_WINDOW};
 
@@ -84,16 +84,17 @@ fn page_start(store: &ReaderStore, selection: u16, portrait: bool) -> Option<usi
 fn read_page<D, T, const MD: usize, const MF: usize, const MV: usize>(
     store: &mut ReaderStore,
     card_root: &Directory<'_, D, T, MD, MF, MV>,
+    listing: &OpenListing<'_, D, T, MD, MF, MV>,
     start: usize,
 ) -> Option<usize>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let path = store.browse().path().clone();
     let counts = store.folder_counts();
     let mut window: [LibraryRow; LIBRARY_WINDOW] = Default::default();
-    let filled = page_library_rows(card_root, &path, counts, start, &mut window)
+    let filled = listing
+        .page(card_root, counts, start, &mut window)
         .ok()
         .flatten()?;
     store.begin_folder_page(start);
@@ -137,7 +138,15 @@ where
     if store.folder_covers(start, need) {
         return false;
     }
-    let _ = read_page(store, card_root, start);
+    let path = store.browse().path().clone();
+    match open_listing(card_root, &path).ok().flatten() {
+        Some(listing) => {
+            let _ = read_page(store, card_root, &listing, start);
+        }
+        // Best-effort, as the doc above says: a card that would not answer
+        // costs this paint its rows.
+        None => store.begin_folder_page(start),
+    }
     true
 }
 
@@ -157,7 +166,11 @@ where
     T: TimeSource,
 {
     let path = store.browse().path().clone();
-    let counts = count_library_rows(card_root, &path).ok().flatten()?;
+    // One resolution for both halves. The count and the page address the
+    // same folder, and opening it twice walked the card root for the shelf
+    // and then every component again.
+    let listing = open_listing(card_root, &path).ok().flatten()?;
+    let counts = listing.counts(card_root).ok()?;
     let total = addressable_rows(counts.total())?;
     store.set_folder_counts(counts);
     store.browse_mut().set_count(total);
@@ -166,7 +179,7 @@ where
     if let Some(start) = page_start(store, selection, portrait) {
         // The count said there are rows, so a page that will not read is the
         // card going away between the two reads, not an empty folder.
-        read_page(store, card_root, start)?;
+        read_page(store, card_root, &listing, start)?;
     }
     Some(Listing {
         depth: path.depth() as u8,
@@ -319,7 +332,11 @@ where
 {
     store.clear_folder_page();
     let path = store.browse().path().clone();
-    let counts = count_library_rows(card_root, &path).ok().flatten()?;
+    // One resolution for the count and for every page the walk below reads.
+    // The walk covers the whole parent a window at a time, so resolving per
+    // page made the cost of going back up grow with the folder twice over.
+    let listing = open_listing(card_root, &path).ok().flatten()?;
+    let counts = listing.counts(card_root).ok()?;
     let total = addressable_rows(counts.total())?;
     store.set_folder_counts(counts);
     // The return finds its folder by name, and the resident page holds only a
@@ -335,7 +352,8 @@ where
     let mut skip = 0usize;
     let mut card_failed = false;
     while skip < usize::from(total) {
-        let filled = match page_library_rows(card_root, &path, counts, skip, &mut window)
+        let filled = match listing
+            .page(card_root, counts, skip, &mut window)
             .ok()
             .flatten()
         {
@@ -365,7 +383,7 @@ where
     let selection = store.browse().selection();
     store.clear_folder_page();
     if let Some(start) = page_start(store, selection, portrait) {
-        read_page(store, card_root, start)?;
+        read_page(store, card_root, &listing, start)?;
     }
     Some(Listing {
         depth: path.depth() as u8,

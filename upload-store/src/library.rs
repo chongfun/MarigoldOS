@@ -516,7 +516,27 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let listed = with_dir(root, path, |dir| -> Result<(), InstallError> {
+    let listed = with_dir(root, path, |dir| children_of(dir, path, &mut on_child))?;
+    match listed {
+        Some(result) => result.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The listing half of [`for_each_child`], against a directory already open.
+///
+/// `path` is still needed, and only for the locator each child would need:
+/// a name can fit and still have no address from here.
+fn children_of<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+    on_child: &mut impl FnMut(&Child) -> ControlFlow<()>,
+) -> Result<(), InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    {
         let mut storage = [0u8; LFN_SCAN_BYTES];
         let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
         let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
@@ -574,10 +594,6 @@ where
             return Err(InstallError::Card);
         }
         Ok(())
-    })?;
-    match listed {
-        Some(inner) => inner.map(Some),
-        None => Ok(None),
     }
 }
 
@@ -908,30 +924,187 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let root_books = if path.is_root() {
-        count_root_books(card_root)?
-    } else {
-        0
-    };
-    let Some(shelf) = open_library_root(card_root)? else {
-        return Ok(path.is_root().then_some(RowCounts {
-            shelf_books: 0,
-            root_books,
-            shelf_folders: 0,
-        }));
-    };
-    let Some((shelf_books, shelf_folders)) = count_children_split(&shelf, path)? else {
+    let Some(listing) = open_listing(card_root, path)? else {
         return Ok(None);
     };
-    Ok(Some(RowCounts {
-        shelf_books,
-        root_books,
-        shelf_folders,
+    listing.counts(card_root).map(Some)
+}
+
+/// The directories one Library listing works against, opened once.
+///
+/// A listing counts its rows and then fills a window from them, and the
+/// window is filled again for every page a caller walks through. Resolved
+/// separately, each of those halves opens the shelf by scanning the card
+/// root and then walks every component of the path again, once per half and
+/// again per region. That repetition was most of what entering or leaving a
+/// folder cost: three or four resolutions where one place is being read.
+///
+/// Held open instead. The handles live as long as the listing does, so the
+/// card is walked to the folder once and every count and page after that
+/// starts from the folder itself.
+pub struct OpenListing<'a, D, T, const MD: usize, const MF: usize, const MV: usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    /// `None` is a card with no shelf, which still has a library made of
+    /// whatever sits loose at its root.
+    shelf: Option<Directory<'a, D, T, MD, MF, MV>>,
+    /// The folder the path names, when it names one below the shelf. At the
+    /// library root the shelf is the folder, so this stays empty and
+    /// [`OpenListing::here`] falls back to it.
+    descended: Option<Directory<'a, D, T, MD, MF, MV>>,
+    path: LibraryPath,
+}
+
+impl<'a, D, T, const MD: usize, const MF: usize, const MV: usize> OpenListing<'a, D, T, MD, MF, MV>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    /// The folder being listed, or `None` on a card with no shelf.
+    fn here(&self) -> Option<&Directory<'a, D, T, MD, MF, MV>> {
+        self.descended.as_ref().or(self.shelf.as_ref())
+    }
+
+    /// How many rows this listing shows, split by region.
+    ///
+    /// The same answer [`count_library_rows`] gives, from the handles
+    /// already open.
+    pub fn counts(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+    ) -> Result<RowCounts, InstallError> {
+        let root_books = if self.path.is_root() {
+            count_root_books(card_root)?
+        } else {
+            0
+        };
+        let Some(here) = self.here() else {
+            return Ok(RowCounts {
+                shelf_books: 0,
+                root_books,
+                shelf_folders: 0,
+            });
+        };
+        let mut shelf_books = 0usize;
+        let mut shelf_folders = 0usize;
+        children_of(here, &self.path, &mut |child| {
+            if child.is_dir {
+                shelf_folders += 1;
+            } else {
+                shelf_books += 1;
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(RowCounts {
+            shelf_books,
+            root_books,
+            shelf_folders,
+        })
+    }
+
+    /// Fill `window` with the rows after `skip`, and say how many landed.
+    ///
+    /// The same answer [`page_library_rows`] gives, from the handles already
+    /// open, so walking a folder a page at a time resolves nothing per page.
+    pub fn page(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+        counts: RowCounts,
+        skip: usize,
+        window: &mut [LibraryRow],
+    ) -> Result<Option<usize>, InstallError> {
+        let mut filled = 0usize;
+        let mut at = skip;
+        for (region, kind, root) in [
+            (counts.shelf_books, Kind::Book, BookRoot::Library),
+            (counts.root_books, Kind::Book, BookRoot::CardRoot),
+            (counts.shelf_folders, Kind::Folder, BookRoot::Library),
+        ] {
+            if filled == window.len() {
+                break;
+            }
+            if at >= region {
+                at -= region;
+                continue;
+            }
+            match root {
+                // The card root is the directory the caller already holds,
+                // and a root locator has no components, so this side had
+                // nothing to resolve to begin with.
+                BookRoot::CardRoot => fill_region_in(
+                    card_root,
+                    &LibraryPath::root(),
+                    kind,
+                    root,
+                    at,
+                    window,
+                    &mut filled,
+                )?,
+                BookRoot::Library => {
+                    if let Some(here) = self.here() {
+                        fill_region_in(here, &self.path, kind, root, at, window, &mut filled)?;
+                    }
+                }
+            }
+            at = 0;
+        }
+        Ok(Some(filled))
+    }
+}
+
+/// Open the shelf and walk to the folder a path names, once.
+///
+/// Takes the card's own root and opens the shelf itself, so a caller cannot
+/// hand a library-root-relative locator to the wrong directory. That is the
+/// same guarantee [`count_library_rows`] makes, kept here because the
+/// handles now outlive a single call.
+///
+/// `Ok(None)` is a path that is not a directory under the shelf. A card with
+/// no shelf answers for the library root and for nothing below it.
+pub fn open_listing<'a, D, T, const MD: usize, const MF: usize, const MV: usize>(
+    card_root: &Directory<'a, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+) -> Result<Option<OpenListing<'a, D, T, MD, MF, MV>>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    #[cfg(feature = "bench-selftest")]
+    walk_probe::walk();
+    let Some(shelf) = open_library_root(card_root)? else {
+        if !path.is_root() {
+            return Ok(None);
+        }
+        return Ok(Some(OpenListing {
+            shelf: None,
+            descended: None,
+            path: path.clone(),
+        }));
+    };
+    let mut descended: Option<Directory<'a, D, T, MD, MF, MV>> = None;
+    for component in path.components() {
+        let dir = descended.as_ref().unwrap_or(&shelf);
+        let Some(entry) = entry_in(dir, component)? else {
+            return Ok(None);
+        };
+        if !entry.is_dir {
+            return Ok(None);
+        }
+        let next = dir.open_dir(entry.alias).map_err(|_| InstallError::Card)?;
+        descended = Some(next);
+    }
+    Ok(Some(OpenListing {
+        shelf: Some(shelf),
+        descended,
+        path: path.clone(),
     }))
 }
 
-/// Fill what is left of `window` from one region, and say how many landed.
-fn fill_region<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// Fill what is left of `window` from one region of a directory already open.
+#[allow(clippy::too_many_arguments)]
+fn fill_region_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,
     kind: Kind,
@@ -939,13 +1112,13 @@ fn fill_region<D, T, const MD: usize, const MF: usize, const MV: usize>(
     skip: usize,
     window: &mut [LibraryRow],
     filled: &mut usize,
-) -> Result<Option<()>, InstallError>
+) -> Result<(), InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let mut seen = 0usize;
-    for_each_child(dir, path, |child| {
+    children_of(dir, path, &mut |child| {
         if !kind.holds(child) {
             return ControlFlow::Continue(());
         }
@@ -991,45 +1164,10 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let shelf = open_library_root(card_root)?;
-    let mut filled = 0usize;
-    // The shelf's books, then the card root's, then the shelf's folders. Each
-    // region takes whatever of the skip it covers; what is left over belongs
-    // to the next.
-    let mut at = skip;
-    for (region, kind, root) in [
-        (counts.shelf_books, Kind::Book, BookRoot::Library),
-        (counts.root_books, Kind::Book, BookRoot::CardRoot),
-        (counts.shelf_folders, Kind::Folder, BookRoot::Library),
-    ] {
-        if filled == window.len() {
-            break;
-        }
-        if at >= region {
-            at -= region;
-            continue;
-        }
-        let listed = match root {
-            BookRoot::CardRoot => fill_region(
-                card_root,
-                &LibraryPath::root(),
-                kind,
-                root,
-                at,
-                window,
-                &mut filled,
-            )?,
-            BookRoot::Library => match shelf.as_ref() {
-                Some(shelf) => fill_region(shelf, path, kind, root, at, window, &mut filled)?,
-                None => Some(()),
-            },
-        };
-        if listed.is_none() {
-            return Ok(None);
-        }
-        at = 0;
-    }
-    Ok(Some(filled))
+    let Some(listing) = open_listing(card_root, path)? else {
+        return Ok(None);
+    };
+    listing.page(card_root, counts, skip, window)
 }
 
 #[cfg(test)]
