@@ -125,8 +125,8 @@ pub fn is_hidden_entry(path: &str) -> bool {
 /// **This is an early exit, not the whole rule.** FAT's own `.` and `..`
 /// entries are short-only and dot-led, so they answer `false` here, and
 /// each caller still owes the filtering that drops them. The two that list
-/// directories, `for_each_child` and `nth_walkable_subdir`, render the
-/// alias and run [`is_hidden_entry`] over it, which is where those two go.
+/// directories, `children_of` and `nth_walkable_subdir`, render the alias
+/// and run [`is_hidden_entry`] over it, and those two entries go there.
 /// The book walk, `visit_books_in`, drops directories before reaching
 /// either helper, so they do not arrive there at all. A caller that took
 /// this for the whole rule and listed directories would show them as rows.
