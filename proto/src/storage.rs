@@ -185,11 +185,14 @@ pub fn catalog_scan_name<'a>(long_name: Option<&'a str>, short_name: &'a str) ->
         Some(name) => name,
         // No long name at all, which is an ordinary 8.3-only entry: books
         // uploaded before long-name support, and anything copied on as 8.3
-        // from a computer. The short name is the whole name. A short name
-        // cannot begin with a dot, so the hidden-entry test below never fires
-        // on this branch -- it is applied uniformly rather than skipped,
-        // because a rule that runs on one branch and not the other is the
-        // shape this bug already took once.
+        // from a computer. The short name is the whole name. The only
+        // dot-led short names FAT produces are its own `.` and `..`, and
+        // both callers of this drop directories before reaching it, so the
+        // hidden-entry test below does not fire on this branch today. It is
+        // applied uniformly rather than skipped, because a rule that runs on
+        // one branch and not the other is the shape this bug already took
+        // once, and because that reason lives in the callers rather than
+        // here.
         None => short_name,
     };
     (is_epub_path(name) && !is_hidden_entry(name)).then_some(name)
@@ -443,6 +446,9 @@ mod tests {
         );
         assert_eq!(catalog_scan_name(None, "_BOOK~1.EPU"), Some("_BOOK~1.EPU"));
         assert_eq!(catalog_scan_name(None, "NOTES.TXT"), None);
+        // FAT's own entries, should a caller ever stop filtering directories.
+        assert_eq!(catalog_scan_name(None, "."), None);
+        assert_eq!(catalog_scan_name(None, ".."), None);
     }
 
     /// A long name the scan could not read comes back empty, and the short

@@ -573,9 +573,14 @@ where
                 Some(long) => long,
                 None => rendered.as_str(),
             };
-            // A short-only entry has reached here unexamined: its alias
-            // cannot be dot-led, and the test is kept over both branches
-            // rather than skipped on one.
+            // A short-only entry has reached here unexamined, and this is
+            // the test that examines it. An ordinary 8.3 name cannot be
+            // dot-led, since a leading dot is not a legal 8.3 character,
+            // but FAT's own `.` and `..` are exactly that: short-only,
+            // dot-led, and reported to this callback like any other
+            // directory. So the test runs over both branches, and the
+            // long-name check above is an early exit rather than a
+            // replacement for it.
             if proto::storage::is_hidden_entry(shown) {
                 return ControlFlow::Continue(());
             }
