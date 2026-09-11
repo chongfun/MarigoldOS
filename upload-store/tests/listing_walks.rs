@@ -148,6 +148,10 @@ fn path(text: &str) -> LibraryPath {
 /// resolve entries climbing with each page read. Before this, entering a
 /// folder resolved it for the count and again for the page, and walking a
 /// folder a window at a time resolved it once per window.
+///
+/// The rows each page returns are asserted too, so the test stands on its
+/// own: a listing that resolved once and paged wrongly would otherwise read
+/// as a pass here and fail only in the wrapper tests next door.
 #[test]
 fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
     let mgr = open_mgr(new_card());
@@ -177,11 +181,34 @@ fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
     let counts = listing.counts(&root).expect("count");
     assert_eq!(counts.total(), 6, "the fixture is what the walk reads");
     let mut window: [LibraryRow; 2] = Default::default();
-    listing.page(&root, counts, 0, &mut window).expect("page");
-    listing.page(&root, counts, 2, &mut window).expect("page");
-    listing.page(&root, counts, 4, &mut window).expect("page");
+    let mut seen = Vec::new();
+    for skip in [0usize, 2, 4] {
+        let filled = listing
+            .page(&root, counts, skip, &mut window)
+            .expect("page")
+            .expect("rows");
+        assert_eq!(filled, 2, "each page of two is full");
+        seen.extend(
+            window
+                .iter()
+                .take(filled)
+                .map(|row| row.child.name.as_str().to_string()),
+        );
+    }
     let (_, resolved_after, iterated_after) = walk_probe::take();
 
+    assert_eq!(
+        seen,
+        vec![
+            "Book 0.epub",
+            "Book 1.epub",
+            "Book 2.epub",
+            "Book 3.epub",
+            "Book 4.epub",
+            "Book 5.epub",
+        ],
+        "three pages off one listing walk the folder once through, in order",
+    );
     assert_eq!(
         resolved_after, 0,
         "a count and three pages off an open listing resolve nothing",
@@ -189,6 +216,62 @@ fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
     assert!(
         iterated_after > 0,
         "they do read the folder, so the counter is live",
+    );
+}
+
+/// The same, two components down, where a resolution costs two directory
+/// scans rather than one and a per-page resolution would cost the most.
+#[test]
+fn a_listing_two_folders_down_resolves_once_as_well() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    books.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = child(&books, "Fiction");
+    fiction.make_dir_in_dir_lfn("Space Opera").expect("mkdir");
+    let nested = child(&fiction, "Space Opera");
+    for name in ["Dune.epub", "Foundation.epub", "Hyperion.epub"] {
+        let file = nested.create_file_in_dir_lfn(name).expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+
+    let _ = walk_probe::take();
+    let listing = open_listing(&root, &path("Fiction/Space Opera"))
+        .expect("read")
+        .expect("a directory");
+    let (_, resolved_opening, _) = walk_probe::take();
+    assert!(
+        resolved_opening > 0,
+        "two components is two directory scans, and both happen here",
+    );
+
+    let counts = listing.counts(&root).expect("count");
+    assert_eq!(counts.total(), 3);
+    let mut window: [LibraryRow; 2] = Default::default();
+    let first = listing
+        .page(&root, counts, 0, &mut window)
+        .expect("page")
+        .expect("rows");
+    assert_eq!(first, 2);
+    let names: Vec<&str> = window
+        .iter()
+        .take(first)
+        .map(|row| row.child.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Dune.epub", "Foundation.epub"]);
+    let second = listing
+        .page(&root, counts, 2, &mut window)
+        .expect("page")
+        .expect("rows");
+    assert_eq!(second, 1);
+    assert_eq!(window[0].child.name.as_str(), "Hyperion.epub");
+
+    let (_, resolved_after, _) = walk_probe::take();
+    assert_eq!(
+        resolved_after, 0,
+        "depth does not make a page resolve again",
     );
 }
 
