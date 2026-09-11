@@ -4140,6 +4140,68 @@ class BoardBudgetTests(unittest.TestCase):
         self.assertEqual(bench.resolve_budgets_path(None, "x4"), bench.DEFAULT_BUDGETS)
         self.assertEqual(bench.resolve_budgets_path(None, "x3"), bench.DEFAULT_BUDGETS_X3)
 
+    def test_capture_board_x3_round_trip_infers_x3_budget_profile(self) -> None:
+        """Capture with board='x3' records metadata; flagless report selects X3 budget profile."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "log.jsonl"
+            capture_args = argparse.Namespace(
+                command="page-turn",
+                port="/dev/bench-test",
+                out=out,
+                seconds=1,
+                reset_before=False,
+                espflash="espflash",
+                strict=False,
+                board="x3",
+                budgets=None,
+                note=[],
+                book=None,
+                turns=1,
+            )
+
+            def fake_capture_lines(*_args: Any, **_kwargs: Any) -> Any:
+                return iter(
+                    [
+                        "input: Some(Next) gpio0=1 gpio1=1 gpio2=0 t=1000",
+                        "bench: refresh mode=Fast busy_ms=307 t_ms=1307",
+                        (
+                            "bench: render view=Reading mode=Fast page=1 ch=0 "
+                            "layout_ms=15 flush_ms=307 prestage_ms=24 t_ms=1354 req_ms=1000"
+                        ),
+                        "bench: prestage staged=true elapsed_ms=24",
+                    ]
+                )
+
+            with (
+                patch.object(bench, "capture_lines", fake_capture_lines),
+                patch("builtins.print"),
+                patch("sys.stdout", io.StringIO()),
+            ):
+                bench.run_capture(capture_args)
+
+            events = [
+                json.loads(line)
+                for line in out.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            run_start = next(e for e in events if e.get("event") == "run_start")
+            self.assertEqual(run_start.get("board"), "x3")
+
+            report_args = argparse.Namespace(
+                paths=[out],
+                budgets=None,
+                board=None,
+                strict=True,
+                all=False,
+            )
+            with (
+                patch.object(bench, "load_budgets", wraps=bench.load_budgets) as mock_load,
+                patch("builtins.print"),
+            ):
+                ret = bench.run_report(report_args)
+                self.assertEqual(ret, 0)
+                mock_load.assert_called_with(bench.DEFAULT_BUDGETS_X3)
+
     def test_resolve_budgets_path_explicit_overrides_board(self) -> None:
         custom = Path("custom.toml")
         self.assertEqual(bench.resolve_budgets_path(custom, "x3"), custom)
