@@ -172,6 +172,20 @@ storage-cache selftest on "185s of the 500s requested" with `done` in the
 same log. Only `done` earns that; a clock stop or a non-done result keeps
 the contract.
 
+### A full sequence eats the book
+
+Running all five suites back to back turns about 150 pages: 50 for
+page-turn, 18 for sleep-sync across its boots, 36 for storage-cache, and
+whatever the soak reaches. The suites share the card and the reading
+position, so the soak run last opens a book the others have already
+advanced.
+
+On 2026-09-12 that ended the soak at page 302 with `invalid=end-of-book`
+twice and `result=short-turns`, and it refused to certify. Nothing was
+wrong with the device. Either start from a book at least 150 pages from its
+end, or run `reader-soak` first and the page-turn suites after it. The
+other four suites certify in any order.
+
 ### Choosing a scenario
 
 `BENCH_SCENARIO` picks one at build time, defaulting to `page-turn`. Every
