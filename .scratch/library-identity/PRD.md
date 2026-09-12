@@ -174,6 +174,24 @@ For a filesystem change performed outside Calendula where the same locator now c
 - reconcile conservatively using available library metadata and source evidence;
 - assign a new `BookId` if continuity cannot be established safely.
 
+A copy the library adopted without reading it has no recorded bytes, and a
+same-sized replacement at its own locator is invisible to the scan's cheap
+filter. Such a copy therefore takes its source identity from the bytes read at
+its own locator while that locator appeared unchanged, which may be a
+replacement rather than the bytes it was adopted with. This is accepted rather
+than defended against:
+
+- no later observation can distinguish the two, since nothing recorded what
+  the original bytes were;
+- defending against it means reading every book as the scan adopts it, which
+  costs hours on a full card for a move that may never happen;
+- the derived caches already resume the old copy's place at a same-sized
+  replacement, so the rule makes an existing local false positive durable
+  across a later move rather than introducing one.
+
+A copy that arrived through a Calendula transaction is outside this rule: its
+bytes were read as it landed, and its source identity is that reading.
+
 A path is therefore neither permanent identity nor sufficient evidence of replacement. Calendula-managed transaction intent may establish continuity that an unexplained external filesystem change cannot.
 
 ### R5. Reconciliation happens between transactions
@@ -219,6 +237,23 @@ Its only role is candidate filtering.
 
 Reconciliation must still confirm a chosen match with `SourceDigest`.
 
+**Measured on the X3 on 2026-09-12, and not introduced.** A whole-file read
+and SHA-256 runs at 580 kB/s on the bench card, so one 8.45 MB book costs
+14.6 s. A scan of a card nobody reorganised reads nothing at all, because the
+search runs only between records that named no row and rows no record named. A
+fingerprint could only skip a file whose byte length matches that of a missing
+copy and whose bytes then differ, and EPUB lengths are spread widely enough
+that a thousand-book library expects under one such pair; where lengths do
+collide reliably the files are two copies of one book, which share a digest as
+well as a length and are refused as ambiguous either way. The file that
+actually moved is read whatever else is added, since R7 makes the digest the
+proof.
+
+What would reopen this is a library holding many same-length books that are
+not copies of each other. That shows up as `hashed` far exceeding `repaired`
+in the scan's bench line, and both counters ship for that reason. The captures
+are in `.scratch/library-identity/M4-measurements.md`.
+
 ### R9. Ambiguity must not merge state
 
 If one old record could plausibly match multiple new files, or multiple old records share the same source:
@@ -250,6 +285,15 @@ At minimum:
 - book-open state persisted across restart;
 
 must follow `BookId`, not locator.
+
+Milestone 3 delivers the first of those and not the second, as the bench
+confirmed. A repaired locator carries the reading position to the new place,
+because the scan copies it between cache directories as it repairs. The record
+of which book was open is addressed by place and does not follow, so a device
+that finds a moved book again comes up in the library rather than back in the
+book, though opening it resumes where the reader left off. The Reading
+Position and Layout Durability PRD closes the gap by moving both onto
+`BookId`.
 
 ### R12. Content-derived state may be shared
 
@@ -548,7 +592,13 @@ Recovery strategy should prefer:
 
 - rename within a directory preserves `BookId`;
 - move across directories preserves `BookId`;
-- move plus reboot preserves position.
+- move plus reboot preserves position, except where the card refuses the write
+  that carries it. While reading positions are addressed by place, a repaired
+  locator has to copy the position between two cache directories, and a card
+  that refuses that write costs the copy its place rather than failing the
+  scan, since failing it would let an unwritable cache stop the library being
+  rebuilt. The exception ends with the position format migration, after which a
+  repaired locator preserves the position with nothing to copy.
 
 ### Replacement tests
 
@@ -627,6 +677,20 @@ Only if needed:
 - add `MoveFingerprint`;
 - measure large-card reconciliation;
 - preserve full digest as final confirmation.
+
+**Closed on the bench on 2026-09-12, without the fingerprint.** The
+measurement R8 asks for was taken on the X3 at 21 books. The identity join is
+166 ms of a 454 ms cold rebuild; an unreorganised card reads no book at all; a
+real move, two files renamed on a computer inside one folder, was repaired
+under its own `BookId` and cost one whole-file read, 30.1 s of a 31.5 s scan;
+and the background read that records a sideloaded copy's bytes leaves page
+turns and layout unchanged while it runs. R8 says what would reopen the
+fingerprint, and `.scratch/library-identity/M4-measurements.md` holds the
+captures.
+
+Large-card reconciliation is the part still unmeasured. The bench card holds
+21 books, so the join's per-row cost was extrapolated rather than observed,
+and the 1129-book card is where it would show.
 
 ## Done when
 
