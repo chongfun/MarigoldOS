@@ -505,6 +505,36 @@ fn names_in(root: &Dir<'_>, at: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// The listing decides an entry is platform metadata from its long name,
+/// before it renders the alias, so the rule has to hold for a folder as well
+/// as a file. A Mac writes `._<folder>` beside a copied folder too.
+///
+/// The exact-match assertion also pins the half of the rule the long name
+/// cannot decide. `Fiction` is a subdirectory, so FAT gives it `.` and `..`
+/// entries of its own, and the driver reports both as short-only entries
+/// whose rendered alias is dot-led. They are dropped downstream, first by
+/// `is_hidden_entry` on that alias and again by the locator check, since
+/// neither `.` nor `..` is a legal path component. So the long-name test
+/// is an early exit rather than the whole rule.
+#[test]
+fn a_hidden_folder_is_no_more_a_row_than_a_hidden_file() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = child(&root, "Fiction");
+    for name in ["Space Opera", "._Space Opera", ".hidden"] {
+        fiction.make_dir_in_dir_lfn(name).expect("mkdir");
+    }
+
+    let mut listed = names_in(&root, "Fiction");
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![("Space Opera".to_string(), true)],
+        "the sidecar folder and the dot-led folder are not rows",
+    );
+}
+
 #[test]
 fn a_folder_shows_its_books_and_folders_and_nothing_else() {
     let mgr = open_mgr(new_card());

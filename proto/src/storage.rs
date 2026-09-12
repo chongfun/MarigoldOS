@@ -113,6 +113,30 @@ pub fn is_hidden_entry(path: &str) -> bool {
     path.rsplit('/').next().unwrap_or(path).starts_with('.')
 }
 
+/// Whether a scanned directory entry is platform metadata a walk can drop
+/// before it renders the entry's alias.
+///
+/// Takes the `long` half of what an `iterate_dir_lfn` callback receives, so
+/// a walk can drop a sidecar before rendering its 8.3 alias or measuring its
+/// locator. Every dot-led entry a writer creates has a long name, since a
+/// leading dot is not a legal 8.3 character: FAT gives `._<book>.epub` an
+/// LFN chain, and the alias it also carries has lost the dot.
+///
+/// **This is an early exit, not the whole rule.** FAT's own `.` and `..`
+/// entries are short-only and dot-led, so they answer `false` here, and
+/// each caller still owes the filtering that drops them. The two that list
+/// directories, `children_of` and `nth_walkable_subdir`, render the alias
+/// and run [`is_hidden_entry`] over it, and those two entries go there.
+/// The book walk, `visit_books_in`, drops directories before reaching
+/// either helper, so they do not arrive there at all. A caller that took
+/// this for the whole rule and listed directories would show them as rows.
+///
+/// An empty long name is the buffer overflow case, not a hidden entry, and
+/// is left to the caller that already refuses it; see [`MAX_LFN_UTF8_BYTES`].
+pub fn is_hidden_scan_entry(long_name: Option<&str>) -> bool {
+    matches!(long_name, Some(name) if is_hidden_entry(name))
+}
+
 /// How many UTF-8 bytes a FAT long filename can occupy, and so how large a
 /// buffer the SD scan must lend `embedded-sdmmc` to assemble one.
 ///
@@ -164,11 +188,14 @@ pub fn catalog_scan_name<'a>(long_name: Option<&'a str>, short_name: &'a str) ->
         Some(name) => name,
         // No long name at all, which is an ordinary 8.3-only entry: books
         // uploaded before long-name support, and anything copied on as 8.3
-        // from a computer. The short name is the whole name. A short name
-        // cannot begin with a dot, so the hidden-entry test below never fires
-        // on this branch -- it is applied uniformly rather than skipped,
-        // because a rule that runs on one branch and not the other is the
-        // shape this bug already took once.
+        // from a computer. The short name is the whole name. The only
+        // dot-led short names FAT produces are its own `.` and `..`, and
+        // both callers of this drop directories before reaching it, so the
+        // hidden-entry test below does not fire on this branch today. It is
+        // applied uniformly rather than skipped, because a rule that runs on
+        // one branch and not the other is the shape this bug already took
+        // once, and because that reason lives in the callers rather than
+        // here.
         None => short_name,
     };
     (is_epub_path(name) && !is_hidden_entry(name)).then_some(name)
@@ -353,6 +380,18 @@ mod tests {
     /// duplicate of a real book that can never open.
     #[test]
     fn appledouble_sidecars_are_not_books() {
+        assert!(is_hidden_scan_entry(Some("._book.epub")));
+        assert!(is_hidden_scan_entry(Some(".DS_Store")));
+        assert!(!is_hidden_scan_entry(Some("book.epub")));
+        // The alias half does not decide, since a sidecar's alias has lost
+        // its dot. An entry with no long name is left to the later check,
+        // and FAT's `.` and `..` are exactly that case: short-only, dot-led,
+        // and caught by `is_hidden_entry` on the rendered alias.
+        assert!(!is_hidden_scan_entry(None));
+        assert!(is_hidden_entry("."));
+        assert!(is_hidden_entry(".."));
+        // The overflow case belongs to the caller that refuses it.
+        assert!(!is_hidden_scan_entry(Some("")));
         assert!(is_hidden_entry("._book.epub"));
         assert!(is_hidden_entry("/._book.epub"));
         assert!(is_hidden_entry("/books/._book.epub"));
@@ -410,6 +449,15 @@ mod tests {
         );
         assert_eq!(catalog_scan_name(None, "_BOOK~1.EPU"), Some("_BOOK~1.EPU"));
         assert_eq!(catalog_scan_name(None, "NOTES.TXT"), None);
+        // FAT's own entries are refused, though as non-EPUBs rather than as
+        // hidden ones: the EPUB test comes first and short-circuits.
+        assert_eq!(catalog_scan_name(None, "."), None);
+        assert_eq!(catalog_scan_name(None, ".."), None);
+        // The hidden test on the short-name branch, reached only by a
+        // dot-led name that does end in .epub. FAT produces none, since a
+        // leading dot is not a legal 8.3 character, so this pins the rule
+        // rather than a case the card can present.
+        assert_eq!(catalog_scan_name(None, ".hidden.epub"), None);
     }
 
     /// A long name the scan could not read comes back empty, and the short
