@@ -905,6 +905,59 @@ fn a_destination_holding_neither_landing_is_refused_until_looked_at() {
         .expect("the shelf takes changes again");
 }
 
+/// The two journals disagree here, and the firmware has to read both.
+///
+/// A replacement intent stands, the install that carried it settled and
+/// cleared, and the destination holds neither legal landing. `recover_installs`
+/// then has nothing to report: no intent of its own, and complete. Only the
+/// library intent knows the place is unresolved, so anything deciding on the
+/// install outcome alone would go on serving a catalog row whose identity
+/// nothing has vouched for.
+#[test]
+fn a_refused_replacement_leaves_the_install_journal_reporting_nothing() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let old = body(1, 3_000);
+    upload(&root, &books, BOOK, &old, || {})
+        .unwrap()
+        .expect("lands");
+
+    let new = body(2, 4_100);
+    replace::begin(
+        &root,
+        BookRoot::Library,
+        BOOK,
+        Some(PredecessorSeen {
+            locator: BOOK,
+            byte_size: old.len() as u32,
+            digest: Some(digest_of(&old)),
+        }),
+        digest_of(&new),
+        &mut words(),
+    )
+    .unwrap();
+    overwrite_shelf(&root, BOOK, &body(9, 3_000));
+
+    reclaim::recover(&root, Some(&books)).expect("reclaim settles");
+    let outcome = install::recover_installs(&root, &books);
+    assert!(
+        outcome.complete,
+        "the install journal has nothing in flight"
+    );
+    assert!(!outcome.had_intent, "and reports no intent of its own");
+    assert!(!outcome.touched_shelf, "and changed nothing on the shelf");
+    assert_eq!(
+        replace::recover(&root),
+        Ok(Recovery::Refused),
+        "while the library intent cannot say what stands at the place"
+    );
+    assert!(
+        replace::read(&root).unwrap().is_some(),
+        "so it stays standing"
+    );
+}
+
 /// The installer does not read the predecessor, so its intent says
 /// "unknown" whatever the ledger recorded of it, and a stranger at the place
 /// under a standing intent is read as the predecessor: the sole-writer

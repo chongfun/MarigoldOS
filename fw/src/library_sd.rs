@@ -52,6 +52,13 @@ enum CatalogFault {
     /// catalog written before it may name a file that is now gone. The
     /// rescan that follows is the repair, not a symptom.
     Reclaimed,
+    /// Recovery could not finish, so nothing has established what the shelf
+    /// now holds. A refused replacement is the sharp one: `INSTALL.JNL` has
+    /// already cleared, so no install reports an intent, while the ledger has
+    /// yet to be told which bytes stand at the locator. The scan that follows
+    /// refuses to rebuild for the same reason, so the library stays empty
+    /// until a mount where recovery settles.
+    Unreconciled,
 }
 
 /// What a lookup of one place in the catalog found.
@@ -89,6 +96,7 @@ impl CatalogFault {
             Self::Invalid => "invalid",
             Self::Device => "error",
             Self::Reclaimed => "reclaimed",
+            Self::Unreconciled => "unreconciled",
         }
     }
 }
@@ -485,7 +493,23 @@ pub(crate) fn load_catalog_cache(
         // follows rebuilds it against the shelf as it now stands.
         let loaded = read_catalog_window(root, library, 0);
         if loaded.is_ok() {
-            let recovery = reconcile_interrupted_uploads(root).outcome;
+            let reconciled = reconcile_interrupted_uploads(root);
+            // Recovery that could not finish says nothing about what the
+            // shelf holds, and a snapshot is worth no more than the recovery
+            // that proved it current. The scan refuses to rebuild on these
+            // same two conditions, so without them here a cache hit is the
+            // one path that serves a shelf recovery declined to vouch for.
+            //
+            // The refused replacement is the case that needs saying. Its
+            // `INSTALL.JNL` has already cleared, so `had_intent` below is
+            // false and the install reads as settled, while the ledger has
+            // yet to learn which bytes stand at the locator and the catalog
+            // row still carries the predecessor's identity.
+            if !reconciled.shelf_readable || !reconciled.may_mutate {
+                library.clear_catalog();
+                return Err(CatalogFault::Unreconciled);
+            }
+            let recovery = reconciled.outcome;
             // Not just what this pass changed. An install whose shelf-changing
             // steps happened before the reset leaves this pass with only a
             // rollback copy to reclaim -- nothing in /BOOKS changes now, but
