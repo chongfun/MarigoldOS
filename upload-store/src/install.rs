@@ -459,11 +459,12 @@ pub enum InstallError {
     /// anything is written until it is fixed on a computer. Unlike
     /// [`Self::Card`] a retry without changing the card cannot help.
     Ambiguous,
-    /// The library ledger refused: it is damaged, or of a version this build
-    /// does not read, so the copy being replaced cannot have its identity
-    /// looked up or recorded. The install is not started, or, after the swap,
-    /// the book is on the shelf with its intent standing for the next mount.
-    /// Nothing changes the shelf until the ledger is looked at.
+    /// The library ledger refused: it is damaged, of a version this build
+    /// does not read, or full with no record it may evict, so the copy being
+    /// replaced cannot have its identity looked up or recorded. The install is
+    /// not started, or, after the swap, the book is on the shelf with its
+    /// intent standing for the next mount. Nothing changes the shelf until the
+    /// ledger is looked at.
     Ledger,
 }
 

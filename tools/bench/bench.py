@@ -1537,11 +1537,12 @@ def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, 
 #            interrupted upload, so any catalog written before it may name a
 #            file that is now gone. The rescan that follows is the repair.
 #   unreconciled  recovery could not finish, so nothing established what the
-#            shelf holds. Unlike the four above, the scan that follows refuses
-#            to rebuild for the same reason, so the reader is left with no
+#            shelf holds. Where a miss, a stale snapshot and a reclaimed one
+#            are all answered by the scan that follows, this one is not: that
+#            scan refuses to rebuild for the same reason, so the reader has no
 #            library until a mount where recovery settles. A finding.
 #
-# `miss` is deliberately the narrowest of the five: the firmware used to
+# `miss` is deliberately the narrowest of them: the firmware used to
 # reduce the whole read to a bool inside the SD session, so a refused read, a
 # failed seek and a torn file all surfaced as that benign one.
 CATALOG_LOAD_RESULTS = {
@@ -1556,8 +1557,8 @@ CATALOG_LOAD_RESULTS = {
 
 # The results that mean something went wrong. `miss`, `stale` and `reclaimed`
 # do not: a catalog not built yet, one the firmware has outgrown, and one
-# retired because recovery deleted a file it might name — all three answered
-# by the same scan.
+# retired because recovery deleted a file it might name, each answered by the
+# same scan.
 CATALOG_LOAD_FAULTS = {"invalid", "error", "unreconciled"}
 
 # How the report names each one, so a miss does not read as a fault.

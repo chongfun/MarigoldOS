@@ -768,7 +768,10 @@ pub(crate) enum EvidenceStep {
     Finished,
     /// The card would not give the book up, or gave up less of it than it
     /// said it held. Nothing is recorded from a partial read, so the job is
-    /// dropped and the next open starts it over.
+    /// dropped whole. The caller decides when to ask again: the display task
+    /// leaves this copy alone until the reader has opened another book, or
+    /// until the next session, rather than reading at a card that just
+    /// refused on every page turn.
     Abandoned,
 }
 

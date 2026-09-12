@@ -8,6 +8,7 @@
 use core::ops::ControlFlow;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Directory, LfnBuffer, Mode, TimeSource, Timestamp,
@@ -2848,8 +2849,13 @@ fn the_two_journals_hand_off_across_a_cut_at_any_write() {
 
 /// A word source for minting ids in these tests: distinct, and not random,
 /// since nothing here asserts on the ids themselves.
+///
+/// Distinct across call sites, which is the part that took a fix. Every
+/// generator started from one seed, so two uploads in a test minted the same
+/// id and the ledger held a duplicate no production path can produce.
 fn words() -> impl FnMut() -> u32 {
-    let mut state = 0x2545_F491u32;
+    static SEED: AtomicU32 = AtomicU32::new(0x2545_F491);
+    let mut state = SEED.fetch_add(0x9E37_79B9, Ordering::Relaxed);
     move || {
         state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         state

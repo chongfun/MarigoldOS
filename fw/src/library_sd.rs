@@ -421,6 +421,34 @@ where
                 };
             }
         }
+    } else {
+        // Looked for, not resolved: the intent is only resolved after the
+        // filesystem transaction settles, which this one has not. An intent
+        // standing over an unsettled install names a locator whose identity is
+        // undecided, and a scan let through here would mint a fresh id for
+        // whatever spelling the shelf holds now.
+        match upload_store::replace::read(root) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                esp_println::println!(
+                    "sd: a replacement stands over an unfinished install; \
+                     not rebuilding the catalog"
+                );
+                return Reconciled {
+                    outcome,
+                    shelf_readable: true,
+                    may_mutate: false,
+                };
+            }
+            Err(fault) => {
+                esp_println::println!("sd: library ledger {:?}; not rebuilding the catalog", fault);
+                return Reconciled {
+                    outcome,
+                    shelf_readable: true,
+                    may_mutate: false,
+                };
+            }
+        }
     }
     if !outcome.swept {
         // Invisible to the reader either way; the next mount tries again.
