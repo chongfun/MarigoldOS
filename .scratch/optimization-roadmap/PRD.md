@@ -4,7 +4,7 @@ Status: **WS-A reopened, and it has now paid out.** **A13 landed as #89 on
 2026-09-04**, the first item shipped since WS-A was reopened and the first
 in this document verified by a before-and-after device capture rather than
 by a single measurement: predicted −200 ms on every FastClean, measured
-−199. A12 is now the top of Tier 1. A new WS-G owns app-state render
+−199, and A12 followed as #92 on 2026-09-11 at −73. A14 is now the top of Tier 1. A new WS-G owns app-state render
 invalidation; the bench harness has an owner for the first time. **Tier 0 is
 implemented** (`opt/tier0-measurement-integrity`) and **the double repaint is
 merged** (#56), so the two largest items in the round are resolved within it.
@@ -138,7 +138,7 @@ is the opposite of what was expected when this started.
 | # | Item | WS | Why it ranks here | Effort |
 |---|---|---|---|---|
 | ~~1~~ | ~~**A13, FastClean's 200 ms trailing settle**~~ | A | **LANDED as #89, 2026-09-04.** Predicted −200 ms; measured −199 on an X3 A/B. See Landed. | done |
-| 2 | **A12 — the 136 ms that is not waveform drive** | A | `busy_ms = 136.0 + 12.79 × frames` fits three modes to under 1 ms. 136 ms is **36% of every Fast BUSY** and is controller interval, not drive. Prime suspect is a CDI nibble never varied since the reference driver. **One byte, one capture; potentially ~77–100 ms off every refresh = 18–24% of a page turn.** Test before building. | S to test |
+| ~~2~~ | ~~**A12, the 136 ms that is not waveform drive**~~ | A | **LANDED as #92, 2026-09-11.** The CDI nibble was the suspect and the fix: `0x9` to `0xF`. Predicted 77 to 100 ms off every refresh; measured **73 ms** on an unattended X3 A/B, Fast BUSY 379 to 306 and a page turn 426 to 353. See Landed. | done |
 | 3 | **A14 — frame-identity guard at the flush seam** | A | **G2 shipped as #56**, so the double repaint is gone. A14 remains worth landing: `fb == prev_fb` catches an identical frame from *any* cause — the 62-refresh end-of-book case, the loading plate's duplicate flush, six no-op input sites — and being below the reducer it cannot strand the reader the way an event-layer suppression can. Measure the hit rate first (`identical=<bool>` on `bench: render`); under ~2% outside the known cases, drop it. | S–M |
 | 4 | **C2** — measure sleep current with the fuel gauge, then hold GPIOs if it indicts them | C | **Unblocked 2026-07-30: the first-line experiment needs no meter and no disassembly.** The X3's BQ27220 sits on the battery and keeps integrating while the SoC is in deep sleep, so a charge-register read, a 24–72 h sleep, and a second read give average standby draw. Over 48 h, 15 µA is 0.72 mAh against 300 µA's 14.4 mAh — decisive even at 1 mAh resolution, and a null result *is* the answer. Cost is one register and one `println!`. The series meter drops to a follow-up for if it comes back high. **The "which GPIOs" half now has two named suspects from the 2026-08-06 upstream sweep, so a high reading has somewhere to go: (a) the X3 SD rail on GPIO13 — we drive that pin nowhere and so never cut the card for sleep, and freeink confirmed the pin by factory-firmware RE (`x3-sd-rail-sleep-power`); and (b) the panel RST line floating in deep sleep, closed unmerged as PR #70, which upstream reports as ~36 h-to-dead on a UC8179 while calling the SSD1677 tolerant. Neither is confirmed on our hardware and the gauge cannot separate them, but the card can be removed outright for a control run, making (a) the cheaper one to isolate.** **Sharpened 2026-08-13, then corrected the same day.** Upstream's 12.8 µA X3 figure is measured **with GPIO13 driven low and latched** (`HalPowerManager.cpp:89-90`), so it bounds what the hardware can reach rather than describing a board left alone — which makes the SD rail a *stronger* suspect, not a settled one. Two further findings moved this item: **GPIO13 is the C3's flash SPIWP pad** (so the card powers up because the pin is muxed to flash at boot, not because anything holds it high — a third case neither document had), and **our deep sleep never runs esp-hal's digital-pad isolation pass at all**, because it is gated on a hold bit esp-hal never writes. The latter affects every unheld pad, is the more likely explanation for a high reading, and is investigable today with no hardware. Do that before the 72-hour gauge run. Also: crosspoint `9b1fb712` guards GPIO13 to Xteink C3 boards, so a fix must be board-gated. | S |
 
@@ -248,67 +248,54 @@ without merging, so it is not listed here; see Tier 3.
 
 ## Current measured baselines
 
-**X3, unattended, main `72b24f3` (2026-09-10).** Quote these, not anything
-older. Taken by the `bench-selftest` build that #90 landed, with nobody at
-the keys: page-turn (50 turns at the 1.5 s quiet cadence calibrated against
-a hand), sleep-sync (3 cycles), storage-cache (to its own `result=done`) and
-folder-nav (20 round trips), each `--strict` clean against the PR #91
-budgets. Captures are `base-*.jsonl` in the session scratchpad; the recipe
-is `docs/agents/bench.md`. This is the before-capture for every WS-A item
-below, per rule 13.
+**X3, unattended, main `0fdde34` (2026-09-12).** Quote these, not anything
+older. All five suites taken by the `bench-selftest` build with nobody at
+the keys, `--strict --board x3` clean on four; the reader soak is the
+exception and for a fixture reason, below. Captures are `a12-*.jsonl` in
+the session scratchpad; the recipe is `docs/agents/bench.md`.
 
 | Metric | Value |
 |---|---|
-| Reading layout, portrait | 16 ms median / 17 p95 |
-| Render flush, Fast | 404 ms median (379 ms of it panel BUSY) |
-| Full refresh | two BUSY intervals per Full render: 928 ms waveform + 379 ms clean pass, flush 1,764 ms |
+| **Page turn, press-to-settled** | **353 ms** median, 357 p95, 339 min, 361 max, queue wait 0 |
+| Render flush, Fast | 332 ms median (306 ms of it panel BUSY) |
+| FastClean BUSY | 383 ms |
+| Full refresh | two BUSY intervals per Full render: 856 ms waveform + 307 ms clean pass |
+| Reading layout, portrait | 15 ms median / 17 p95 |
 | Prestage | 24 ms |
-| Progress write | **88 ms** median on the 8 GB card, 74 on the 64 GB card (was 42 in July on a card since retired). Card-bound: see below |
-| **Page turn, press-to-settled** | **426 ms** median, 427 p95, 412 min, 438 max, queue wait 0 |
-| Warm book open (cache built, RAM miss) | 65 to 137 ms, median 87, p95 126 (n=21), foldered card |
-| Catalog load | 47 ms |
-| Folder enter | 49 to 50 ms into a 7-row folder, 85 to 87 ms into a 14-row one |
-| Folder leave | 39 to 41 ms |
-| Boot to first paint, cold | 3,086 ms (`x3 init done` at 1,318 ms) |
-| Boot to first paint, timer wake from deep sleep | 2,173 ms median (2,161 to 2,185, n=2) |
+| Progress write | 74 ms (card-bound, see below) |
+| Warm book open (cache built, RAM miss) | 38 to 89 ms, median 55 (n=42) |
+| Catalog load | 27 ms |
+| Folder enter | 27 ms median |
+| Folder leave | 15 ms |
+| Boot to first paint, cold | 2,863 to 3,170 ms |
+| Boot to first paint, timer wake | 1,933 ms median |
 
-Two things in that table are new information rather than confirmation.
+Three changes separate cleanly across the captures on disk, which is worth
+recording because a single before-and-after would have credited all of it
+to whichever landed last:
 
-The progress write doubled between July and now, 42 to 88 ms, and an
-investigation on 2026-09-10 split it on the device. A progress write is two
-durable files, the global state record and the per-book position, each a
-two-generation write of six card operations: read A, read B, open-truncate
-the target, write it, close it, read it back. On the 8 GB card one such file
-costs 32 ms, of which the three write-side operations cost 28 (truncate 7.8,
-data write 5.1, close with its directory and FAT update 14.6, up to 33) and
-the three reads 9. On a freshly formatted 64 GB card with the same content,
-the same file costs 27 ms (writes 23, reads 4). #88 adds a catalog-record
-read and a claim-file read per progress write, measured at 8 ms by an A/B
-that alternated the #87 position path with the current one on successive
-writes. So the figure is card-bound: the cards differ by two in single-sector
-program latency (a cold build wrote at 2.2 to 2.5 ms per block on the
-August card and 4.8 on the 8 GB one), the code's share of the change is 8 ms,
-and nothing in the SD driver or the write primitives changed. What the
-split does point at is the write protocol itself: three separate
-sector-write operations per file where an in-place overwrite of a fixed-size
-record would need one plus the directory timestamp, and a read-back verify
-on every write. That is a candidate item for issue 02 or WS-D, sized here
-at roughly 15 to 20 ms per progress write, and it is the only part of this
-number the firmware controls.
+| Metric | 8 GB card, 72b24f3 | 64 GB card, 72b24f3 | + #94 | main 0fdde34 |
+|---|---|---|---|---|
+| Fast BUSY | 379 ms | 379 ms | 379 ms | **306 ms** |
+| Folder enter | 85 ms | 29 ms | **26 ms** | 27 ms |
+| Folder leave | 40 ms | 18 ms | **15 ms** | 15 ms |
+| Progress write | 88 ms | **73 ms** | 73 ms | 74 ms |
+| Catalog load | 47 ms | **26 ms** | 26 ms | 27 ms |
 
-Boot- and wake-to-first-paint had been listed below as never measured; they
-are now, and the 913 ms between them is the Full refresh a cold boot pays
-and a wake does not, plus the difference in `x3 init done`.
+So A12 moved the display and nothing else, #94 moved navigation and nothing
+else, and the card swap moved every storage figure. A12's 73 ms matches the
+72 ms its own pull request measured by hand, taken a different way.
 
-The 64 GB card also moved every other storage figure: warm open 36 to 64 ms
-(from 65 to 137), folder enter 28 to 29 ms (from 49 to 87), folder leave 17
-to 19 ms (from 39 to 41), with the display figures unchanged to the
-millisecond. Every storage baseline in this document is therefore a
-per-card figure and should name the card it was taken on; the 8 GB card is
-the reference until the roadmap says otherwise.
+**The reader soak is the one suite that did not certify, and the harness was
+right to say so.** Run last in a five-suite sequence, it opened a book the
+earlier suites had already turned 104 pages into, met the end at page 302,
+wrote `invalid=end-of-book` twice and `result=short-turns`, and refused to
+certify. A full sequence consumes roughly 150 pages, so it needs a book at
+least that far from its end, or the soak run first. Recorded in
+`docs/agents/bench.md` rather than treated as a defect.
 
 **Display, X3, deliberate cadence, 50 turns (2026-07-27, main `e9163b3`).**
-Superseded by the table above; kept for the comparison.
+Superseded twice over; kept for the comparison.
 
 | Metric | Value |
 |---|---|
