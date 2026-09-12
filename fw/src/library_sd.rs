@@ -272,8 +272,8 @@ where
     // Only the first is a clean shelf.
     let books = match upload_store::library::open_library_root(root) {
         Ok(Some(books)) => books,
-        // No shelf means no install can be finished here, but a record may
-        // still be describing one -- and a record that stands must keep a
+        // No shelf means no install can be finished here, but either journal
+        // may still be describing one -- and a record that stands must keep a
         // cached catalog from being trusted and keep a fresh one from being
         // published, whether or not there is a /BOOKS to look at.
         Ok(None) => {
@@ -328,6 +328,28 @@ where
                 Ok(IntentState::Valid(_)) | Ok(IntentState::Unrecognized) => (true, false),
                 Err(_) => (true, false),
             };
+            // The library transaction does not live on the shelf. It stands
+            // in /READER and can name a copy at the card root, so a scan let
+            // through here would age the record of a copy whose identity is
+            // still in flight. Nothing can resolve it without a shelf to read
+            // the landing from, so a standing intent only refuses.
+            let settled = match upload_store::replace::read(root) {
+                Ok(None) => true,
+                Ok(Some(_)) => {
+                    esp_println::println!(
+                        "sd: a replacement stands and there is no shelf; \
+                         not rebuilding the catalog"
+                    );
+                    false
+                }
+                Err(fault) => {
+                    esp_println::println!(
+                        "sd: library ledger {:?}; not rebuilding the catalog",
+                        fault
+                    );
+                    false
+                }
+            };
             return Reconciled {
                 outcome: upload_store::install::InstallRecovery {
                     touched_shelf: false,
@@ -339,7 +361,7 @@ where
                 // root to walk.
                 shelf_readable: true,
                 // Reclaim settled above, or this branch returned there.
-                may_mutate: true,
+                may_mutate: settled,
             };
         }
         Err(_) => {

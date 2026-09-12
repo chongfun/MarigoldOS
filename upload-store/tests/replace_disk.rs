@@ -238,6 +238,8 @@ fn read_exact(file: &CardFile<'_>, mut out: &mut [u8]) -> bool {
 }
 
 const BOOK: &str = "Dune.epub";
+/// A book at the card root, where nothing nests and no shelf is needed.
+const LOOSE: &str = "Loose.epub";
 /// The same name as the card matches it, spelled another way.
 const BOOK_RESPELLED: &str = "dune.epub";
 
@@ -903,6 +905,65 @@ fn a_destination_holding_neither_landing_is_refused_until_looked_at() {
     upload(&root, &books, "Other.epub", &body(4, 1_000), || {})
         .unwrap()
         .expect("the shelf takes changes again");
+}
+
+/// A card with no shelf still has a library transaction to answer for.
+///
+/// The intent stands in /READER, not on the shelf, and it can name a copy at
+/// the card root. A mount that reads only the install journal sees nothing.
+#[test]
+fn a_standing_intent_is_readable_on_a_card_with_no_shelf() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let volume = mgr.open_volume(VolumeIdx(0)).expect("open volume");
+    let raw_root = mgr
+        .open_root_dir(volume.to_raw_volume())
+        .expect("open root");
+    let root = Directory::new(raw_root, &mgr);
+    assert!(
+        matches!(library::open_library_root(&root), Ok(None)),
+        "this card has no shelf at all"
+    );
+    assert_eq!(
+        replace::read(&root).expect("a card with no journal reads clean"),
+        None,
+        "and nothing standing, so a blank card is not refused"
+    );
+
+    let old = body(1, 3_000);
+    sideload(&root, LOOSE, &old);
+    let (_, ids) = scan(&root, &[(BookRoot::CardRoot, LOOSE, old.len() as u32)])
+        .expect("the scan adopts the loose book");
+    let id = ids[0].expect("under an id of its own");
+
+    let new = body(2, 4_100);
+    let standing = replace::begin(
+        &root,
+        BookRoot::CardRoot,
+        LOOSE,
+        Some(PredecessorSeen {
+            locator: LOOSE,
+            byte_size: old.len() as u32,
+            digest: Some(digest_of(&old)),
+        }),
+        digest_of(&new),
+        &mut words(),
+    )
+    .expect("the intent publishes without a shelf");
+    assert_eq!(standing.id, id);
+
+    assert!(
+        matches!(library::open_library_root(&root), Ok(None)),
+        "there is still no shelf"
+    );
+    assert!(
+        install::read_intent(&root).expect("journal") == install::IntentState::Absent,
+        "and no install journal to report the copy in flight"
+    );
+    assert!(
+        replace::read(&root).expect("the journal reads").is_some(),
+        "so the library intent is the only thing that says one is"
+    );
 }
 
 /// The two journals disagree here, and the firmware has to read both.
