@@ -903,7 +903,9 @@ somewhere, and a question that outlives a scan wants a journal of its own
 rather than a state spread through the catalog, the ledger and the cache.
 What a card costs a scan is therefore the reading of every file whose length
 changed hands, which is the size of the reorganisation rather than the size
-of the library. A file the card would not give up costs its whole length:
+of the library: measured on the X3, a whole-file read and hash runs at about
+580 kB a second, so a book of eight megabytes costs fifteen seconds to prove
+and a card nobody reorganised costs nothing at all. A file the card would not give up costs its whole length:
 what the files of that length hold is not known well enough to say which
 copy any of them is, so those copies are left alone and the files adopted
 in their own right.
