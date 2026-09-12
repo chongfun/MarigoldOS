@@ -239,7 +239,7 @@ Reconciliation must still confirm a chosen match with `SourceDigest`.
 
 **Measured on the X3 on 2026-09-12, and not introduced.** A whole-file read
 and SHA-256 runs at 580 kB/s on the bench card, so one 8.45 MB book costs
-14.6 s. A scan of a card nobody reorganised reads nothing at all, because the
+14.6 s. A scan of a card nobody reorganized reads nothing at all, because the
 search runs only between records that named no row and rows no record named. A
 fingerprint could only skip a file whose byte length matches that of a missing
 copy and whose bytes then differ, and EPUB lengths are spread widely enough
@@ -251,8 +251,7 @@ proof.
 
 What would reopen this is a library holding many same-length books that are
 not copies of each other. That shows up as `hashed` far exceeding `repaired`
-in the scan's bench line, and both counters ship for that reason. The captures
-are in `.scratch/library-identity/M4-measurements.md`.
+in the scan's bench line, and both counters ship for that reason.
 
 ### R9. Ambiguity must not merge state
 
@@ -680,13 +679,18 @@ Only if needed:
 
 **Closed on the bench on 2026-09-12, without the fingerprint.** The
 measurement R8 asks for was taken on the X3 at 21 books. The identity join is
-166 ms of a 454 ms cold rebuild; an unreorganised card reads no book at all; a
+166 ms of a 454 ms cold rebuild; an unreorganized card reads no book at all; a
 real move, two files renamed on a computer inside one folder, was repaired
 under its own `BookId` and cost one whole-file read, 30.1 s of a 31.5 s scan;
 and the background read that records a sideloaded copy's bytes leaves page
 turns and layout unchanged while it runs. R8 says what would reopen the
-fingerprint, and `.scratch/library-identity/M4-measurements.md` holds the
-captures.
+fingerprint.
+
+One lead came out of that repair. The scan's own read ran at about 285 kB/s
+against the 580 kB/s the same read reaches in the background job, because the
+scan holds the catalog and the ledger open while it hashes and the block cache
+works against itself. It is worth chasing if repairs ever become common, and
+worth nothing while a reorganization is rare.
 
 Large-card reconciliation is the part still unmeasured. The bench card holds
 21 books, so the join's per-row cost was extrapolated rather than observed,
