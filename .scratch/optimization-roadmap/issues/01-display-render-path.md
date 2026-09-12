@@ -257,6 +257,69 @@ can never disagree with `prev_fb` on the skip path.
   either the restriction costs A14 its most common case or the boot and wake
   double-paint is a separate item.
 
+**The measurement was taken, 2026-09-12, on main `0fdde34`.** `identical`
+and `cmp_us` were added to `bench: render`, and a `bench: plate` line to the
+loading plate, which flushes without a render record and would otherwise
+have gone uncounted. Nothing branched on either; this counted only. One
+`reader-soak`, 230 renders and 29 plates. The instrumentation was not
+landed, since paying the compare without the skip buys nothing.
+
+**A14 lives, by a wide margin, and the cost model is better than the item
+assumed.**
+
+| | renders | identical |
+|---|---|---|
+| `bench: render` | 230 | 8 (3.5%) |
+| loading plate | 29 | **29 (100%)** |
+| both | 259 | 37 (14.3%) |
+
+The compare does not cost one price. It early-exits on the first differing
+byte, so a miss is **14 to 16 µs** and only a hit pays the full scan of the
+frame, **4.6 to 5.3 ms**. The item's 250 to 800 µs estimate described
+neither. The common path is 40 times cheaper than estimated, and the
+expensive path is the one that saves 435 ms, so the item's "over ~5 ms,
+revisit" trigger was written for a cost that is not paid unconditionally.
+Break-even on the measured mean is **0.17%** against a measured **3.5%**,
+about a 20x return on the render path alone before the plates are counted.
+
+**The named suspicion from #89 is disproved, and it was the item's main
+evidence.** Both patterns it described are there in the capture, a boot's
+Full followed 446 ms later by a FastClean of the same view and page, and a
+wake's FastClean followed by a Fast of the same view and page, 46 such
+pairs across the run. **None of them is byte-identical.** So the "~4-6% of
+renders are candidates" reading was wrong, and with it the worry that
+restricting the predicate to `Fast` would cost A14 its most common case.
+The restriction costs nothing: every one of the 8 render hits is already
+`Fast`, and so is every plate.
+
+**Where the hits actually are**, which is a different inventory than the
+item expected:
+
+- **The loading plate, 29 of 29.** Every plate drawn during the soak
+  already matched the glass. On its own that is 12.6 s of panel time in one
+  run, and it needs no predicate subtlety: the plate is opportunistic, the
+  app is not waiting on it, and a skip there is a pure win.
+- **The Loaded repaint, 7 hits,** in pairs 772 ms apart on pages 1 to 4:
+  the second Fast refresh of A18, when the loaded text happens to match
+  what the placeholder drew. Later pages in the same run show the pair with
+  differing bytes, so this is a fraction of A18's cases rather than all of
+  them, and A14 and A18 are complements rather than substitutes.
+- **The end-of-book redraw, 1 hit,** the case the item predicted, confirmed
+  at page 302.
+
+**One half of the measurement is still owed.** The item asks for a normal
+session as well as the end-of-book case. The session capture taken
+alongside this ran to 5 renders, because the book was parked at its last
+page by the five-suite run before it, so the 3.5% above is the soak's
+figure and a reading session's own rate is unmeasured. It would have to be
+lower than 0.17% to change the verdict, and the plate hits alone already
+rule that out.
+
+**Worth a look while building:** 52,272 bytes compared in 4.6 ms is about
+11 MB/s, slow enough to suggest a byte-wise compare rather than a word-wise
+one. It does not change the verdict, and a faster compare would only widen
+the margin.
+
 ### A15 (unresolved — measure before ranking): `fill_plane`'s 528 single-row transfers
 
 `fill_plane` (`fw/src/display_flush/uc8253.rs:228-241`) writes the white plane
